@@ -87,6 +87,9 @@ class ClonPolicyRunner(OnPolicyRunner):
         # Start training
         start_iter = self.current_learning_iteration
         tot_iter = start_iter + num_learning_iterations
+        
+        self.save(os.path.join(self.log_dir, f"model_prior_train.pt"))
+
         for it in range(start_iter, tot_iter):
             start = time.time()
             # Rollout
@@ -123,15 +126,17 @@ class ClonPolicyRunner(OnPolicyRunner):
                         contact_changed_any = (obs["previliege"] !=prev_contact).any()                    
                     prev_contact = obs["previliege"].clone()
 
-                stop = time.time()
-                collection_time = stop - start
-                start = stop
+            stop = time.time()
+            collection_time = stop - start
+            start = stop
 
             # Update policy
-            if contact_changed_any:
+           
+                # if contact_changed_any:    
+            with torch.enable_grad():        
                 loss_dict = self.alg.update()
-            else:
-                print(f"No contact change found... consider increase currentnum_steps_per_env {self.num_steps_per_env}...")
+                # else:
+                #     print(f"No contact change found... consider increase currentnum_steps_per_env {self.num_steps_per_env}...")
 
             stop = time.time()
             learn_time = stop - start
@@ -184,6 +189,12 @@ class ClonPolicyRunner(OnPolicyRunner):
 
         return alg
 
+    def get_inference_policy(self, device: str | None = None) -> callable:
+        self.eval_mode()  # Switch to evaluation mode (e.g. for dropout)
+        if device is not None:
+            self.alg.policy.to(device)
+        return self.alg.policy.act_inference
+    
 
     def load(self, path: str, load_optimizer: bool = True, map_location: str | None = None) -> dict:
         loaded_dict = torch.load(path, weights_only=False, map_location=map_location)

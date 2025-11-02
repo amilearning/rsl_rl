@@ -120,6 +120,22 @@ class BCStudentTeacher(nn.Module):
         # Create distribution
         self.distribution = Normal(mean, std)
 
+    def act_teacher(self, obs: TensorDict) -> torch.Tensor:
+        obs = self.get_teacher_obs(obs)
+        obs = self.teacher_obs_normalizer(obs)
+        # Compute mean
+        mean = self.teacher(obs)
+        # Compute standard deviation
+        if self.noise_std_type == "scalar":
+            std = self.std.expand_as(mean)
+        elif self.noise_std_type == "log":
+            std = torch.exp(self.log_std).expand_as(mean)
+        else:
+            raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
+        # Create distribution
+        self.distribution = Normal(mean, std)
+        return mean
+    
 
     def act(self, obs: TensorDict) -> torch.Tensor:
         obs = self.get_student_obs(obs)
@@ -131,6 +147,7 @@ class BCStudentTeacher(nn.Module):
         obs = self.get_student_obs(obs)
         obs = self.student_obs_normalizer(obs)
         return self.student(obs)
+
 
     
     def sample_teacher(self, obs: TensorDict) -> torch.Tensor:
@@ -150,7 +167,7 @@ class BCStudentTeacher(nn.Module):
             return teacher_distribution.sample()
         
     
-    def evaluate_teacher(self, obs: TensorDict) -> torch.Tensor:
+    def evaluate(self, obs: TensorDict) -> torch.Tensor:
         obs = self.get_teacher_obs(obs)
         obs = self.teacher_obs_normalizer(obs)
         with torch.no_grad():
@@ -213,6 +230,19 @@ class BCStudentTeacher(nn.Module):
             self.loaded_teacher = True
             self.teacher.eval()
             self.teacher_obs_normalizer.eval()
+
+            # load student
+            student_state_dict = {}
+            student_obs_normalizer_state_dict = {}
+            for key, value in state_dict.items():
+                if "actor." in key:
+                    student_state_dict[key.replace("actor.", "")] = value
+                if "actor_obs_normalizer." in key:
+                    student_obs_normalizer_state_dict[key.replace("actor_obs_normalizer.", "")] = value
+            self.student.load_state_dict(student_state_dict, strict=strict)
+            self.student_obs_normalizer.load_state_dict(student_obs_normalizer_state_dict, strict=strict)
+                       
+
             return False  # Training does not resume
         elif any("student" in key for key in state_dict):  # Load parameters from distillation training
             super().load_state_dict(state_dict, strict=strict)

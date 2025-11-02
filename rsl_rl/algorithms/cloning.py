@@ -65,9 +65,12 @@ class Cloning:
         loss_fn_dict = {
             "mse": nn.functional.mse_loss,
             "huber": nn.functional.huber_loss,
+            "nll": nn.functional.mse_loss 
         }
         if loss_type in loss_fn_dict:
             self.loss_fn = loss_fn_dict[loss_type]
+        elif loss_type == "nll":
+            raise ValueError(f"TODO NLL implementation.")     
         else:
             raise ValueError(f"Unknown loss type: {loss_type}. Supported types are: {list(loss_fn_dict.keys())}")
 
@@ -95,8 +98,8 @@ class Cloning:
     
     def rollout(self, obs: TensorDict) -> torch.Tensor:
         # Compute the actions
-        self.transition.actions = self.policy.evaluate_teacher(obs).detach()
-        self.transition.privileged_actions = self.transition.actions
+        self.transition.actions = self.policy.act_teacher(obs).detach()
+        self.transition.privileged_actions = self.policy.evaluate(obs).detach() 
         # Record the observations
         self.transition.observations = obs
         return self.transition.actions
@@ -104,8 +107,8 @@ class Cloning:
 
     def act(self, obs: TensorDict) -> torch.Tensor:
         # Compute the actions
-        self.transition.actions = self.policy.act(obs).detach()
-        self.transition.privileged_actions = self.policy.evaluate(obs).detach()
+        self.transition.actions = self.policy.act(obs)
+        self.transition.privileged_actions = self.policy.evaluate(obs)
         # Record the observations
         self.transition.observations = obs
         return self.transition.actions
@@ -129,16 +132,17 @@ class Cloning:
         mean_behavior_loss = 0
         loss = 0
         cnt = 0
-
         for epoch in range(self.num_learning_epochs):
             self.policy.reset(hidden_states=self.last_hidden_states)
-            self.policy.detach_hidden_states()
-            for obs, _, privileged_actions, dones in self.storage.generator():
-                # Inference of the student for gradient computation
-                actions = self.policy.act_inference(obs)
+            self.policy.detach_hidden_states()            
+            for obs, tecaher_actions, privileged_actions, dones in self.storage.generator():                
+                # Inference of the student for gradient computation                
+                # noise = torch.randn_like(tecaher_actions) * 1e-5
+                # tecaher_actions +=noise
 
+                actions = self.policy.act_inference(obs)
                 # Behavior cloning loss
-                behavior_loss = self.loss_fn(actions, privileged_actions)
+                behavior_loss = self.loss_fn(actions, tecaher_actions)
 
                 # Total loss
                 loss = loss + behavior_loss
@@ -157,7 +161,7 @@ class Cloning:
                     self.policy.detach_hidden_states()
                     loss = 0
 
-                # Reset dones
+            # Reset dones
                 self.policy.reset(dones.view(-1))
                 self.policy.detach_hidden_states(dones.view(-1))
 
