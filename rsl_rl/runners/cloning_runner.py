@@ -129,7 +129,9 @@ class ClonPolicyRunner(OnPolicyRunner):
             stop = time.time()
             collection_time = stop - start
             start = stop
-            self.alg.relabeling(self.num_steps_per_env, env_cfg = self.env.cfg  )
+            # new_pos_b, new_t1, new_t01 = self.alg.relabeling(self.num_steps_per_env, env_cfg = self.env.cfg)
+            self.alg.vec_relabeling(self.num_steps_per_env, env_cfg = self.env.cfg)
+            # assert torch.norm(new_pos_b-vec_new_pos_b) + torch.norm(new_t1-vec_new_t1) +torch.norm(new_t01-vec_new_t01) < 1e-5
             # Update policy
            
             if contact_changed_any:                
