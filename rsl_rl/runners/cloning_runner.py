@@ -129,14 +129,13 @@ class ClonPolicyRunner(OnPolicyRunner):
             stop = time.time()
             collection_time = stop - start
             start = stop
-
+            self.alg.relabeling(self.num_steps_per_env, env_cfg = self.env.cfg  )
             # Update policy
            
-                # if contact_changed_any:    
-            with torch.enable_grad():        
+            if contact_changed_any:                
                 loss_dict = self.alg.update()
-                # else:
-                #     print(f"No contact change found... consider increase currentnum_steps_per_env {self.num_steps_per_env}...")
+            else:
+                print(f"No contact change found... consider increase currentnum_steps_per_env {self.num_steps_per_env}...")
 
             stop = time.time()
             learn_time = stop - start
