@@ -91,12 +91,25 @@ class ClonPolicyRunner(OnPolicyRunner):
         self.save(os.path.join(self.log_dir, f"model_prior_train.pt"))
 
         for it in range(start_iter, tot_iter):
+            
             start = time.time()
+            ## 
+            
             # Rollout
             with torch.inference_mode():
+                self.env.reset()
                 prev_contact = obs["previliege"].clone()
                 contact_changed_any = torch.tensor(False,device=self.device)
-                for _ in range(self.num_steps_per_env):
+                init_count = 0
+                init_count_max = 50
+                while init_count < init_count_max:                    
+                    if (obs['previliege'].float().mean() >= 0.9):
+                        break               
+                    actions = self.alg.rollout(obs)
+                    obs, rewards, dones, extras = self.env.step(actions.to(self.env.device))                    
+                    init_count+=1
+
+                for rollout_step in range(self.num_steps_per_env):
                     # Sample actions
                     actions = self.alg.rollout(obs)
                     # Step the environment
@@ -129,10 +142,13 @@ class ClonPolicyRunner(OnPolicyRunner):
             stop = time.time()
             collection_time = stop - start
             start = stop
-            # new_pos_b, new_t1, new_t01 = self.alg.relabeling(self.num_steps_per_env, env_cfg = self.env.cfg)
-            self.alg.vec_relabeling(self.num_steps_per_env, env_cfg = self.env.cfg)
+            
+            self.alg.relabeling_batch( env_cfg = self.env.cfg)
+            # self.alg.vec_relabeling(env_cfg = self.env.cfg)
+            # self.alg.vec_relabeling_with_time(self.num_steps_per_env, env_cfg = self.env.cfg)
+            
             # assert torch.norm(new_pos_b-vec_new_pos_b) + torch.norm(new_t1-vec_new_t1) +torch.norm(new_t01-vec_new_t01) < 1e-5
-            # Update policy
+            
            
             if contact_changed_any:                
                 loss_dict = self.alg.update()
@@ -210,3 +226,46 @@ class ClonPolicyRunner(OnPolicyRunner):
             self.current_learning_iteration = loaded_dict["iter"]
         return loaded_dict["infos"]
     
+
+
+    def teacher_eval(self, num_eval_iterations: int) -> None:
+        self._prepare_logging_writer()
+        obs = self.env.get_observations().to(self.device)
+        self.eval_mode()  
+        start_iter = 0
+        tot_iter = num_eval_iterations                
+        
+        for it in range(start_iter, tot_iter): 
+            pose_error_w = torch.zeros(self.num_steps_per_env, self.env.num_envs, dtype=torch.float, device=self.device)           
+            with torch.inference_mode():
+                for rollout_step in range(self.num_steps_per_env):
+                    actions = self.alg.rollout(obs)
+                    obs, rewards, dones, extras = self.env.step(actions.to(self.env.device))                    
+                    if self.log_dir is not None:
+                        pose_error_w[rollout_step,:] =  obs['evaluation'].squeeze().clone()
+                       
+            self.writer.add_scalar("Eval_teacher/pose_error_w_mean", pose_error_w.mean().cpu().numpy().tolist(), it)
+            self.writer.add_scalar("Eval_teacher/pose_error_w_std", pose_error_w.std().cpu().numpy().tolist(), it)
+
+     
+     
+    def student_eval(self, num_eval_iterations: int) -> None:      
+        self._prepare_logging_writer()
+        obs = self.env.get_observations().to(self.device)
+        self.eval_mode()  # switch to train mode (for dropout for example)
+        student_policy = self.get_inference_policy(device=self.env.device)
+        start_iter = 0
+        tot_iter = num_eval_iterations                
+        
+        for it in range(start_iter, tot_iter): 
+            pose_error_w = torch.zeros(self.num_steps_per_env, self.env.num_envs, dtype=torch.float, device=self.device)           
+            with torch.inference_mode():
+                for rollout_step in range(self.num_steps_per_env):   
+                    actions = student_policy(obs)
+                    obs, rewards, dones, extras = self.env.step(actions.to(self.env.device))                
+                    if self.log_dir is not None:
+                        pose_error_w[rollout_step,] =  obs['evaluation'].squeeze().clone()
+                       
+            self.writer.add_scalar("Eval_student/pose_error_w_mean", pose_error_w.mean().cpu().numpy().tolist(), it)
+            self.writer.add_scalar("Eval_student/pose_error_w_std", pose_error_w.std().cpu().numpy().tolist(), it)
+

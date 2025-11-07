@@ -113,237 +113,161 @@ class Cloning:
         self.transition.observations = obs
         return self.transition.actions
 
-    def vec_relabeling(self, relabeling_buffer_size, env_cfg, t1_noise=None, t01_noise=None):
-        # --- setup ---
+    def relabeling_batch(self, env_cfg):
+
+        K = env_cfg.commands.contact_cmd.num_ee
+        contact_history = self.storage.observations['previliege'].clone()   # [T,E,K]
+        # teacher_block = self.storage.observations['teacher'][:, :, -5*K:].clone()
+        cur_contact_pos_b = self.storage.observations['contact_body'].clone().reshape(-1, contact_history.shape[1], K, 3)
+        cur_time = self.storage.observations['time'].clone()                # [T,E,1]
+        cur_time = cur_time.repeat(1,1,K)
+        T, E, _ = contact_history.shape
+
+        in_contact = contact_history.bool()
+        not_contact = ~in_contact
+        '''
+        for in cotact moment, we can easily relable the target goal
+        for contact time,
+        t1 - (rising time) find the last contact moment. and recompute the t1. 
+        t01 - (hold time) find the next detach moment. and recompute the t01
+        '''
+        # contact_start = in_contact.int() & (~torch.cat([torch.zeros_like(in_contact[:1]), in_contact[:-1].int()], dim=0))
+        contact_start = in_contact & (~torch.cat([torch.zeros_like(in_contact[:1]), in_contact[:-1]], dim=0))
+        # contact_end = not_contact & (~torch.cat([torch.zeros_like(not_contact[:1]), not_contact[:-1]], dim=0))
+        contact_end_1side = in_contact & (~torch.cat([in_contact[1:], torch.zeros_like(in_contact[-1:])], dim=0))
+        t_idx = torch.arange(T, device=contact_start.device).view(T,1,1).expand(T,E,K).long()
+
+        '''
+        Find the previous contact index
+        '''
+        left_contact_cand = torch.where(contact_start, t_idx, torch.full_like(t_idx, 0))
+        left_contact_idx  = torch.cummax(left_contact_cand, dim=0)[0]          # [T,E,K], -1 means none to the left
+
+        '''
+        Find the next contact index
+        '''
+        BIG      = torch.full((T,E,K), T-1, device=contact_start.device, dtype=torch.long)
+        cand     = torch.where(contact_start, t_idx, BIG)
+        cand_r   = torch.flip(cand, dims=[0])
+        min_r, _ = torch.cummin(cand_r, dim=0)
+        next_ge  = torch.flip(min_r, dims=[0])                 # [T,E,K] in [0..T]
+        right_contact_idx  = torch.where(next_ge == T, torch.full_like(next_ge, -1), next_ge)
+        
+        '''
+        Find the next detach index
+        '''       
+        BIG = torch.full((T,E,K), T-1, device=in_contact.device, dtype=torch.long)  # sentinel
+        cand_det = torch.where(contact_end_1side, t_idx, BIG)                              # [T,E,K]
+        cand_det_r = torch.flip(cand_det, dims=[0])
+        min_det_r, _ = torch.cummin(cand_det_r, dim=0)
+        right_detach_idx = torch.flip(min_det_r, dims=[0])    
+        # right_detach_idx = torch.where(right_detach_idx == T, torch.full_like(right_detach_idx, -1), right_detach_idx)
+        # invalid_right_detach_mask = right_detach_idx == -1
+        '''
+        To determine the desired contact time:
+        If currently in contact, find the previous contact time.
+        If currently not in contact, find the next contact time. 
+        '''
+        t1_idx = torch.where(in_contact,left_contact_idx, right_contact_idx)
+        t1 = torch.gather(cur_time, dim=0, index=t1_idx)-cur_time
+
+        '''
+        To determine the desired contact holding time: 
+        If currently in contact, find the next contact time.--> hold time = next detach time - prev contact_time 
+        If currently not in contact, find the next detach time. --> hold time = next detach time - next_contact time
+        '''
+        t01_in_contact = torch.gather(cur_time, dim=0, index=right_detach_idx)- torch.gather(cur_time, dim=0, index=left_contact_idx)
+        t01_no_contact = torch.gather(cur_time, dim=0, index=right_detach_idx)- torch.gather(cur_time, dim=0, index=right_contact_idx)
+        t01 = torch.where(in_contact,t01_in_contact,t01_no_contact)
+
+        '''     
+        To find the desired contact point: 
+        If currently in contact, current contact point is the contact target. 
+        If currently not in contact, find the next contact target. 
+        '''
+        right_contact_idx_x4 = right_contact_idx.unsqueeze(-1).expand(-1, -1, -1, 3) 
+        right_contact_idx_x4 = right_contact_idx_x4.clamp(min=0, max=T-1)      
+        right_retarget_pos = torch.gather(cur_contact_pos_b, dim=0, index=right_contact_idx_x4) 
+        in_contact_x4 = in_contact.unsqueeze(-1).expand(-1, -1, -1, 3) 
+        contact_des_pos_b = torch.where(in_contact_x4, cur_contact_pos_b, right_retarget_pos)
+
+        '''
+        relabel the dataset
+        '''
+        contact_pos_cmd = contact_des_pos_b.reshape(T,E,-1)
+        time_cmd = torch.stack([t1,t01],dim=-1).reshape(T,E,-1)
+        self.storage.observations['teacher'][:, :, -5*K:] = torch.cat([contact_pos_cmd,time_cmd],dim=-1).clone()
+        self.storage.observations['policy'][:, :, -5*K:] = torch.cat([contact_pos_cmd,time_cmd],dim=-1).clone()
+        
+
+
+    def relabeling(self, env_cfg):
         policy_dt = env_cfg.sim.dt * env_cfg.decimation
         K = env_cfg.commands.contact_cmd.num_ee
-
-        cur_buffer_start_idx = self.storage.step - relabeling_buffer_size
-        cur_buffer_end_idx   = self.storage.step - 1
-        sl = slice(cur_buffer_start_idx, cur_buffer_end_idx)
-
-        # ===== extract =====
-        contact_history   = self.storage.observations['previliege'][sl].clone()              # [T,E,K] bool
-        teacher_block     = self.storage.observations['teacher'][sl, :, -5 * K:].clone()     # [T,E,5K]
-        cur_contact_pos_b = self.storage.observations['contact_body'][sl].clone()            # [T,E,3K]
-        T, E = teacher_block.shape[:2]
-
-        contact_des_pos_b = teacher_block[:, :, :3*K].reshape(T, E, K, 3)                    # [T,E,K,3]
-        contact_des_time  = teacher_block[:, :, 3*K:].reshape(T, E, K, 2)                    # [T,E,K,2]
-        cur_contact_pos_b = cur_contact_pos_b.reshape(T, E, K, 3)                            # [T,E,K,3]
-
-        t1  = contact_des_time[..., 0].clone()                                               # [T,E,K]
-        t01 = contact_des_time[..., 1].clone()                                               # [T,E,K]
-        # ===== end extract =====
-
-        device, dtype = t1.device, t1.dtype
-        eps = torch.tensor(1e-6, device=device, dtype=dtype)
-
-        H      = contact_history.to(torch.bool)                                              # [T,E,K]
-        pos_cur = cur_contact_pos_b
-        tgrid  = torch.arange(T, device=device).view(T,1,1).expand(T,E,K)                    # [T,E,K]
-
-        # Noise (allow injection for testing equivalence)
-        if t1_noise is None:
-            t1_noise  = torch.zeros((T,E,K), device=device, dtype=dtype)
-        if t01_noise is None:
-            t01_noise = torch.zeros((T,E,K), device=device, dtype=dtype)
-
-        # ---- next True/False absolute indices via suffix-min (flip + cummin) ----
-        bigT = torch.full((T,E,K), T, device=device, dtype=torch.long)
-        idx  = tgrid.to(torch.long)
-
-        # next contact (True) abs index >= t
-        mask_next_true = torch.where(H, idx, bigT)
-        rev_true       = torch.flip(mask_next_true, dims=[0])
-        rev_true_min, _= torch.cummin(rev_true, dim=0)
-        next_true_abs  = torch.flip(rev_true_min, dims=[0])                                  # [T,E,K]
-
-        # next detach (False) abs index >= t
-        mask_next_false = torch.where(~H, idx, bigT)
-        rev_false       = torch.flip(mask_next_false, dims=[0])
-        rev_false_min, _= torch.cummin(rev_false, dim=0)
-        next_false_abs  = torch.flip(rev_false_min, dims=[0])                                 # [T,E,K]
-
-        # relative steps and masks
-        next_true_rel  = (next_true_abs  - tgrid)                                            # [T,E,K]
-        next_false_rel = (next_false_abs - tgrid)
-        has_next_true  = next_true_abs  < T
-        has_next_false = (next_false_abs < T) & (next_false_rel > 0)  # remove zero-step detaches
-
-        rel_to_end            = (2*T - tgrid).to(dtype) * policy_dt
-        next_true_rel_steps   = next_true_rel.to(dtype)  * policy_dt
-        next_false_rel_steps  = next_false_rel.to(dtype) * policy_dt
-
-        # ---- new t1 ----
-        # in contact: t1 ≤ 0
-        t1_in  = -(t1 + t1_noise).abs()
-        # not in contact: time until next contact (≥ eps), else horizon
-        t1_out = torch.where(has_next_true, next_true_rel_steps + t1_noise,
-                                        rel_to_end            + t1_noise)
-        t1_out = torch.clamp(t1_out, min=eps.item())
-        new_t1 = torch.where(H, t1_in, t1_out)
-
-        # ---- new t01 ----
-        # in contact: -t1 + time to next detach (or end) + noise
-        t01_in_raw = torch.where(has_next_false,
-                                -new_t1 + next_false_rel_steps + t01_noise,
-                                -new_t1 + rel_to_end           + t01_noise)
-        # loop semantics: if (t1 + t01) ≤ eps  =>  t01 = -t1 + eps
-        bad_in = (new_t1 + t01_in_raw) <= eps
-        t01_in = torch.where(bad_in, -new_t1 + eps, t01_in_raw)
-
-        # not in contact: duration from *future contact* to its next detach (or end)
-        abs_contact         = next_true_abs
-        abs_contact_clamped = torch.clamp(abs_contact, max=T-1)
-
-        # detach abs index evaluated at the contact time
-        nf_at_contact_abs = torch.gather(next_false_abs, 0, abs_contact_clamped)
-        has_detach_after_contact = (nf_at_contact_abs < T) & (nf_at_contact_abs > abs_contact)
-
-        dur_from_contact = torch.where(
-            has_detach_after_contact,
-            (nf_at_contact_abs - abs_contact).to(dtype) * policy_dt,
-            ((2*T - abs_contact).to(dtype) * policy_dt)
-        )
-
-        t01_out_raw = dur_from_contact + t01_noise
-        # loop semantics: if (t1_out + t01_out_raw) ≤ eps => t01_out = max(eps - t1_out, eps)
-        bad_out       = (t1_out + t01_out_raw) <= eps
-        t01_out_fixed = torch.maximum(eps - t1_out, eps)
-        t01_out       = torch.where(bad_out, t01_out_fixed, t01_out_raw)
-
-        new_t01 = torch.where(H, t01_in, t01_out)
-
-        # ---- new desired pos ----
-        # in contact → current pose; else → pose at next contact if exists; else keep desired
-        idx_time = abs_contact_clamped.unsqueeze(-1).expand(T, E, K, 3)                      # [T,E,K,3]
-        pos_at_contact = torch.gather(pos_cur, dim=0, index=idx_time)                        # [T,E,K,3]
-
-        new_pos_b = torch.where(
-            H.unsqueeze(-1),
-            pos_cur,
-            torch.where(
-                (abs_contact < T).unsqueeze(-1),
-                pos_at_contact,
-                contact_des_pos_b
-            )
-        )                                                                                    # [T,E,K,3]
-
-
-
-        contact_history   = self.storage.observations['previliege'][sl].clone()              # [T,E,K] bool
-        teacher_block     = self.storage.observations['teacher'][sl, :, -5 * K:].clone()     # [T,E,5K]
-        cur_contact_pos_b = self.storage.observations['contact_body'][sl].clone()            # [T,E,3K]
-        T, E = teacher_block.shape[:2]
-
-        contact_des_pos_b = teacher_block[:, :, :3*K].reshape(T, E, K, 3)                    # [T,E,K,3]
-        contact_des_time  = teacher_block[:, :, 3*K:].reshape(T, E, K, 2)                    # [T,E,K,2]
-        cur_contact_pos_b = cur_contact_pos_b.reshape(T, E, K, 3)                            # [T,E,K,3]
-
-        t1  = contact_des_time[..., 0].clone()                                               # [T,E,K]
-        t01 = contact_des_time[..., 1].clone()     
-
-        new_pos_b = new_pos_b.reshape(T,E,-1)
-        new_time = torch.cat([new_t1.unsqueeze(-1),new_t01.unsqueeze(-1)], dim=-1)
-        new_time = new_time.reshape(T,E,-1)
-        new_contact_cmd = torch.cat([new_pos_b, new_time], dim=-1)
-
-        self.storage.observations['teacher'][sl, :, -5 * K:] = new_contact_cmd.clone()
-        self.storage.observations['policy'][sl, :, -5 * K:] = new_contact_cmd.clone()
-       
-
-
-
-    def relabeling(self,relabeling_buffer_size, env_cfg):
-        policy_dt = env_cfg.sim.dt *env_cfg.decimation
-        
         num_ee = env_cfg.commands.contact_cmd.num_ee
-        cur_buffer_start_idx = self.storage.step - relabeling_buffer_size
-        cur_buffer_end_idx = self.storage.step-1        
-        
-        ################# extract observation data ########################
-        sl = slice(cur_buffer_start_idx, cur_buffer_end_idx)
-        contact_history   = self.storage.observations['previliege'][sl].clone()                 # [T,E,num_ee]
-        teacher_block     = self.storage.observations['teacher'][sl, :, -5 * num_ee:].clone()   # [T,E,5*num_ee]
-        cur_contact_pos_b = self.storage.observations['contact_body'][sl].clone()               # [T,E,num_ee*3]
+        # ===== extract =====
+        contact_history   = self.storage.observations['previliege'].clone()              # [T,E,K] bool
+        teacher_block     = self.storage.observations['teacher'][:, :, -5 * K:].clone()     # [T,E,5K]
+        cur_contact_pos_b = self.storage.observations['contact_body'].clone()            # [T,E,3K]
+        cur_time = self.storage.observations['time'].clone()            # [T,E,1]
         T, E = teacher_block.shape[:2]
-        contact_des_pos_b  = teacher_block[:, :, : 3 * num_ee].reshape(T, E, num_ee, 3)   # [T,E,num_ee,3]
-        contact_des_time = teacher_block[:, :, 3 * num_ee:].reshape(T, E, num_ee, 2)    # [T,E,num_ee,2]
-        cur_contact_pos_b = cur_contact_pos_b.reshape(T, E, num_ee, 3)                  # [T,E,num_ee,3]
-        contact_des_time_t1  = contact_des_time[..., 0]  # [T,E,num_ee]
-        contact_des_time_t01 = contact_des_time[..., 1]  # [T,E,num_ee]
-        ################# extract observation data END ########################
-                  
+
+        contact_des_pos_b = teacher_block[:, :, :3*K].reshape(T, E, K, 3)                    # [T,E,K,3]
+        contact_des_time  = teacher_block[:, :, 3*K:].reshape(T, E, K, 2)                    # [T,E,K,2]
+        cur_contact_pos_b = cur_contact_pos_b.reshape(T, E, K, 3)                            # [T,E,K,3]
+
+        t1  = contact_des_time[..., 0].clone()                                               # [T,E,K]
+        t01  = contact_des_time[..., 1].clone()     
+      
         eps = 1e-6
         # # Loop over envs and end-effectors for clarity
         for t in range(T):
             for e in range(E):
                 for k in range(num_ee):
-                 
-                    t_contact = contact_history[t, e, k].bool()
-                    t1_noise = torch.zeros(1,device=contact_des_time_t1.device) # (torch.rand(1, device=contact_des_time_t1.device) - 0.5) * 0.5 * policy_dt
-                    t01_noise = torch.zeros(1,device=contact_des_time_t1.device) # (torch.rand(1, device=contact_des_time_t01.device) - 0.5) * 0.5 * policy_dt
+                    t_contact = contact_history[t, e, k].bool()                    
                     if t_contact:
                         # === CASE 1: currently in contact ===
                         # 1. Set desired pose to current contact pose
                         contact_des_pos_b[t, e, k] = cur_contact_pos_b[t, e, k]
-
-                        # 2. Ensure t1 is non-positive (time since contact)
-                        if contact_des_time_t1[t, e, k] > 0:
-                            contact_des_time_t1[t, e, k] = -abs(contact_des_time_t1[t, e, k]) + t1_noise
-
-                        # 3 find next detach
-                        # Find next detach (first False after t)
-                        h_tail = contact_history[t:, e, k].int()
-                        next_detach_rel = torch.argmax(~h_tail).item() if (~h_tail).any() else None
-
-                        if next_detach_rel is not None and next_detach_rel>0:
-                            # valid detach found
-                            contact_des_time_t01[t, e, k] =  -contact_des_time_t1[t, e, k] + next_detach_rel * policy_dt + t01_noise
+                        # try to find the init contact time 
+                        if t > 0 :                        
+                            h_head = contact_history[:t, e, k].int()
+                            prior_contact_idx = t - (torch.argmin(torch.flip(h_head,dims=[0])))                      
+                            t1[t,e,k] = cur_time[prior_contact_idx,e,0] - cur_time[t,e,0] 
                         else:
-                            # no detach in window
-                            contact_des_time_t01[t, e, k] =   -contact_des_time_t1[t, e, k] +(T - t) * policy_dt + t01_noise
-                        if (contact_des_time_t1[t, e, k] + contact_des_time_t01[t, e, k] <=eps):
-                            contact_des_time_t01[t, e, k] = -contact_des_time_t1[t, e, k] + eps 
-
-                    else:   
-                        # === CASE 2: currently not in contact ===
+                            prior_contact_idx = 0
+                            t1[t,e,k] = -abs(t1[t,e,k])
+                        
                         h_tail = contact_history[t:, e, k].int()
-                        next_contact_rel = torch.argmax(h_tail).item() if h_tail.any() else None                        
-                        if next_contact_rel is not None:
-                            abs_contact = t + next_contact_rel
-                            # 1. Set desired pose to next contact position
-                            contact_des_pos_b[t, e, k] = cur_contact_pos_b[abs_contact, e, k]
-                            # 2. Set time until contact
-                            t1 = next_contact_rel * policy_dt + t1_noise
-                            t1=t1.clamp_min(eps)
-                            contact_des_time_t1[t, e, k] =t1
-                            # 3. Find detach moment after the contact
-                            h_after_contact = contact_history[abs_contact:, e, k].int()
-                            next_detach_rel = torch.argmax(~h_after_contact).item() if (~h_after_contact).any() else None
-                            if next_detach_rel is not None and next_detach_rel > 0:                                
-                                contact_des_time_t01[t, e, k] = next_detach_rel * policy_dt + t01_noise
+                        next_detach_idx = (t+torch.argmin(h_tail)).item()
+                        if next_detach_idx == t:
+                            next_detach_idx = -1
+                        t01[t,e,k] = cur_time[next_detach_idx,e,0] - t1[t,e,k]                       
+                    else: # === CASE 2: currently not in contact ===           
+                        h_tail = contact_history[t:, e, k].int()
+                        next_contact_idx = torch.argmax(h_tail).item() if h_tail.any() else None                                            
+                        if next_contact_idx is not None:
+                            contact_des_pos_b[t, e, k] = cur_contact_pos_b[next_contact_idx, e, k]
+                            t1[t,e,k] = cur_time[next_contact_idx,e,0] - cur_time[t,e,0] 
+
+                            next_h_tail = contact_history[next_contact_idx:, e, k].int()
+                            next_next_contact_idx = torch.argmax(next_h_tail).item() if next_h_tail.any() else None     
+                            if next_next_contact_idx is not None:
+                                t01[t,e,k] = cur_time[next_contact_idx+next_next_contact_idx,e,0] - cur_time[next_contact_idx+next_contact_idx,e,0] 
                             else:
-                                contact_des_time_t01[t, e, k] = (T - abs_contact) * policy_dt+t01_noise
-                                
-                            if (contact_des_time_t1[t, e, k] + contact_des_time_t01[t, e, k] ) <= eps:
-                                contact_des_time_t01[t, e, k] = max(float(eps - contact_des_time_t1[t, e, k]), float(eps))
+                                t01[t,e,k] = cur_time[-1,e,0] - cur_time[next_contact_idx,e,0] 
 
-                        else:
-                            # no contact found in the future
-                                t1  = (T - t) * policy_dt + t1_noise
-                                t01 = (T - t) * policy_dt + t01_noise
-                                t1  = t1.clamp_min(eps)
-                                if (t1 + t01) <= eps:
-                                    t01 = max(float(eps - t1), float(eps))
-                                contact_des_time_t1[t, e, k]  = t1
-                                contact_des_time_t01[t, e, k] = t01
+                        else: # next_contact_idx is all None. so every time detach. 
+                            if t1[t,e,k] <= 0: 
+                                if t < T-1:
+                                    t1[t,e,k] = abs(cur_time[-1,e,0]-cur_time[t,e,0])
+                                else:
+                                    t1[t,e,k] = abs(cur_time[-1,e,0]-cur_time[-2,e,0])
 
 
         
-        new_t1  = contact_des_time_t1.clone().to(device=contact_des_time_t1.device) 
-        new_t01  = contact_des_time_t01.clone().to(device=contact_des_time_t01.device) 
+        new_t1  = t1.clone().to(device=t1.device) 
+        new_t01  = t01.clone().to(device=t01.device) 
         new_pos_b = contact_des_pos_b.clone().to(device=contact_des_pos_b.device)  # [T,E,num_ee,3]
         return new_pos_b, new_t1, new_t01
              
