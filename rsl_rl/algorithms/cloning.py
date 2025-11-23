@@ -21,7 +21,7 @@ class Cloning:
     def __init__(
         self,
         policy: BCStudentTeacher ,
-        num_learning_epochs: int = 1,
+        num_learning_epochs: int = 5,
         gradient_length: int = 15,
         learning_rate: float = 1e-3,
         max_grad_norm: float | None = None,
@@ -112,6 +112,19 @@ class Cloning:
         # Record the observations
         self.transition.observations = obs
         return self.transition.actions
+
+    def relabeling_velolicy_batch(self, env_cfg):
+        # K = env_cfg.commands.contact_cmd.num_ee
+        teacher_obs = self.storage.observations['teacher'].clone()  
+        # self.storage.observations['teacher'][:,:,-3:-1] = teacher_obs[:,:,:2].clone()
+        # self.storage.observations['teacher'][:,:,-1] = teacher_obs[:,:,5].clone()
+        # self.storage.observations['policy'][:,:,-3:-1] = teacher_obs[:,:,:2].clone()
+        # self.storage.observations['policy'][:,:,-1] = teacher_obs[:,:,5].clone()
+
+        self.storage.observations['teacher'][:,:,-3:-1] = teacher_obs[:,:,0:2].clone()
+        self.storage.observations['teacher'][:,:,-1] = teacher_obs[:,:,5].clone()
+        self.storage.observations['policy'][:,:,-3:-1] = teacher_obs[:,:,0:2].clone()
+        self.storage.observations['policy'][:,:,-1] = teacher_obs[:,:,5].clone()
 
     def relabeling_batch(self, env_cfg):
 
@@ -295,38 +308,56 @@ class Cloning:
         for epoch in range(self.num_learning_epochs):
             self.policy.reset(hidden_states=self.last_hidden_states)
             self.policy.detach_hidden_states()            
-            for obs, tecaher_actions, privileged_actions, dones in self.storage.generator():                
-                # Inference of the student for gradient computation                
-                # noise = torch.randn_like(tecaher_actions) * 1e-5
-                # tecaher_actions +=noise
+            batch_obs, batch_teacher_actions, batch_privileged_actions, batch_dones = self.storage.generator_batch(1000)
+            batch_actions = self.policy.act_inference(batch_obs)
+            behavior_loss = self.loss_fn(batch_actions, batch_teacher_actions)
+            loss = behavior_loss
+            mean_behavior_loss = behavior_loss.item()            
+            self.optimizer.zero_grad()
+            loss.backward()
+            if self.is_multi_gpu:
+                self.reduce_parameters()
+            if self.max_grad_norm:
+                nn.utils.clip_grad_norm_(self.policy.student.parameters(), self.max_grad_norm)
+            self.optimizer.step()
+            # self.policy.detach_hidden_states()
+            loss = 0
+            # self.policy.reset(dones.view(-1))
+            # self.policy.detach_hidden_states(dones.view(-1))
+            
+            
+            # for obs, teacher_actions, privileged_actions, dones in self.storage.generator():                
+            #     # Inference of the student for gradient computation                
+            #     # noise = torch.randn_like(teacher_actions) * 1e-5
+            #     # teacher_actions +=noise
 
-                actions = self.policy.act_inference(obs)
-                # Behavior cloning loss
-                behavior_loss = self.loss_fn(actions, tecaher_actions)
+            #     actions = self.policy.act_inference(obs)
+            #     # Behavior cloning loss
+            #     behavior_loss = self.loss_fn(actions, teacher_actions)
 
-                # Total loss
-                loss = loss + behavior_loss
-                mean_behavior_loss += behavior_loss.item()
-                cnt += 1
+            #     # Total loss
+            #     loss = loss + behavior_loss
+            #     mean_behavior_loss += behavior_loss.item()
+            #     cnt += 1
 
-                # Gradient step
-                if cnt % self.gradient_length == 0:
-                    self.optimizer.zero_grad()
-                    loss.backward()
-                    if self.is_multi_gpu:
-                        self.reduce_parameters()
-                    if self.max_grad_norm:
-                        nn.utils.clip_grad_norm_(self.policy.student.parameters(), self.max_grad_norm)
-                    self.optimizer.step()
-                    self.policy.detach_hidden_states()
-                    loss = 0
+            #     # Gradient step
+            #     if cnt % self.gradient_length == 0:
+            #         self.optimizer.zero_grad()
+            #         loss.backward()
+            #         if self.is_multi_gpu:
+            #             self.reduce_parameters()
+            #         if self.max_grad_norm:
+            #             nn.utils.clip_grad_norm_(self.policy.student.parameters(), self.max_grad_norm)
+            #         self.optimizer.step()
+            #         self.policy.detach_hidden_states()
+            #         loss = 0
 
-            # Reset dones
-                self.policy.reset(dones.view(-1))
-                self.policy.detach_hidden_states(dones.view(-1))
+            # # Reset dones
+            #     self.policy.reset(dones.view(-1))
+            #     self.policy.detach_hidden_states(dones.view(-1))
 
-        mean_behavior_loss /= cnt
-        self.storage.clear()
+        # mean_behavior_loss /= cnt
+        # self.storage.clear()
         self.last_hidden_states = self.policy.get_hidden_states()
         self.policy.detach_hidden_states()
 

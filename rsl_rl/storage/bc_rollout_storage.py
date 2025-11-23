@@ -8,6 +8,7 @@ from __future__ import annotations
 import torch
 from collections.abc import Generator
 from tensordict import TensorDict
+import random
 
 from rsl_rl.networks import HiddenState
 from rsl_rl.utils import split_and_pad_trajectories
@@ -78,7 +79,8 @@ class BCRolloutStorage:
     def add_transitions(self, transition: Transition) -> None:
         # Check if the transition is valid
         if self.step >= self.num_transitions_per_env:
-            raise OverflowError("Rollout buffer overflow! You should call clear() before adding new transitions.")
+            self.clear()            
+            # raise OverflowError("Rollout buffer overflow! You should call clear() before adding new transitions.")
 
         # Core
         self.observations[self.step].copy_(transition.observations)
@@ -149,6 +151,29 @@ class BCRolloutStorage:
         # Note: This is to prevent double normalization (i.e. if per minibatch normalization is used)
         if normalize_advantage:
             self.advantages = (self.advantages - self.advantages.mean()) / (self.advantages.std() + 1e-8)
+
+
+    def generator_batch(self, num_samples: int):
+        """
+        Randomly sample `num_samples` transitions and return them as a batch.
+        Returns:
+            observations_batch, actions_batch, privileged_actions_batch, dones_batch
+        """
+        if self.training_type != "distillation":
+            raise ValueError("This function is only available for distillation training.")
+
+        num_samples = min(num_samples, self.num_transitions_per_env)
+
+        # Random unique indices
+        indices = random.sample(range(self.num_transitions_per_env), k=num_samples)
+
+        # Vectorized gathering
+        obs_batch = self.observations[indices]
+        act_batch = self.actions[indices]
+        p_act_batch = self.privileged_actions[indices]
+        done_batch = self.dones[indices]
+
+        return obs_batch, act_batch, p_act_batch, done_batch
 
     # For distillation
     def generator(self) -> Generator:

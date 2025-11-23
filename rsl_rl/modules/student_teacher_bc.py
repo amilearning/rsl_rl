@@ -148,6 +148,10 @@ class BCStudentTeacher(nn.Module):
         obs = self.student_obs_normalizer(obs)
         return self.student(obs)
 
+    def act_teacher_mean(self, obs: TensorDict) -> torch.Tensor:
+        obs = self.get_teacher_obs(obs)
+        obs = self.teacher_obs_normalizer(obs)
+        return self.teacher(obs)
 
     
     def sample_teacher(self, obs: TensorDict) -> torch.Tensor:
