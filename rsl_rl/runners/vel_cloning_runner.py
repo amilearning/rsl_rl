@@ -17,7 +17,7 @@ from rsl_rl.env import VecEnv
 from rsl_rl.modules import BCStudentTeacher
 from rsl_rl.runners import OnPolicyRunner
 from rsl_rl.utils import resolve_obs_groups, store_code_state
-
+import matplotlib.pyplot as plt
 
 class VelClonPolicyRunner(OnPolicyRunner):
     """On-policy runner for training and evaluation of teacher-student training."""
@@ -28,6 +28,10 @@ class VelClonPolicyRunner(OnPolicyRunner):
         self.policy_cfg = train_cfg["policy"]
         self.device = device
         self.env = env
+        self.gp_sampler = self.env.env.env.command_manager._terms['base_velocity'].gp_model
+        self.is_active_sample = self.env.env.env.command_manager._terms['base_velocity'].cfg.active_sample
+        
+        
 
         # Check if multi-GPU is enabled
         self._configure_multi_gpu()
@@ -176,14 +180,12 @@ class VelClonPolicyRunner(OnPolicyRunner):
         alg.init_storage(
             "distillation",
             self.env.num_envs,
-            self.num_steps_per_env,
+            self.num_steps_per_env*10,
             obs,
             [self.env.num_actions],
         )
 
         return alg
-
- 
 
 
     def load(self, path: str, load_optimizer: bool = True, map_location: str | None = None) -> dict:
@@ -199,97 +201,8 @@ class VelClonPolicyRunner(OnPolicyRunner):
             self.current_learning_iteration = loaded_dict["iter"]
         return loaded_dict["infos"]
     
-    # def teacher_eval(self, num_eval_iterations: int) -> None:
-    #     self._prepare_logging_writer()
-    #     obs = self.env.get_observations().to(self.device)
-    #     self.eval_mode()  
-    #     start_iter = 0
-    #     tot_iter = num_eval_iterations                
-    #     teacher_cmd_history = torch.zeros(tot_iter, self.num_steps_per_env, self.env.num_envs, 3,dtype=torch.float, device=self.device)
-    #     error_history = torch.zeros(tot_iter, self.num_steps_per_env, self.env.num_envs,2, dtype=torch.float, device=self.device)
-        
-    #     for it in range(start_iter, tot_iter): 
-    #         lin_vel_xy_error = torch.zeros(self.num_steps_per_env, dtype=torch.float, device=self.device)           
-    #         ang_vel_xy_error = torch.zeros(self.num_steps_per_env, dtype=torch.float, device=self.device)           
-    #         with torch.inference_mode():
-    #             for rollout_step in range(self.num_steps_per_env):                    
-    #                 actions = self.alg.rollout(obs)
-    #                 teacher_cmd_history[it, rollout_step, :, :] = obs['teacher'][:,-3:].clone()
-    #                 obs, rewards, dones, extras = self.env.step(actions.to(self.env.device))                    
-
-    #                 cur_lin_vel = obs['policy'][:,:2].clone()
-    #                 cur_ang_vel = obs['policy'][:,5].clone()
-    #                 cmd_lin_vel = obs['policy'][:,-3:-1].clone()
-    #                 cmd_ang_vel = obs['policy'][:,-1].clone()
-    #                 lin_vel_diff = torch.norm(cmd_lin_vel - cur_lin_vel, dim=-1)
-    #                 ang_vel_diff = torch.norm(cmd_ang_vel.unsqueeze(dim=-1) - cur_ang_vel.unsqueeze(dim=-1), dim =-1)
-    #                 error_history[it, rollout_step, :,0] = lin_vel_diff.clone()
-    #                 error_history[it, rollout_step, :,1] = ang_vel_diff.clone()
-
-    #                 # lin_vel_err = lin_vel_diff[lin_vel_diff < lin_vel_diff.median()+lin_vel_diff.std()].mean()
-    #                 # ang_vel_err = ang_vel_diff[ang_vel_diff < ang_vel_diff.median()+ang_vel_diff.std()].mean()
-
-    #                 lin_vel_xy_error[rollout_step] = lin_vel_diff.mean()
-    #                 ang_vel_xy_error[rollout_step] =ang_vel_diff.mean()
-                       
-                
-    #         self.writer.add_scalar("Eval_teacher/error_vel_xy", lin_vel_xy_error.mean().cpu().numpy().tolist(), it)
-    #         self.writer.add_scalar("Eval_teacher/error_vel_yaw", ang_vel_xy_error.std().cpu().numpy().tolist(), it)
-    #     return teacher_cmd_history, error_history
-     
-     
-    # def student_eval(self, num_eval_iterations: int, teacher_cmd_history = None) -> None:      
-        
-
-    #     self._prepare_logging_writer()
-    #     obs = self.env.get_observations().to(self.device)
-    #     self.eval_mode()  # switch to train mode (for dropout for example)
-    #     student_policy = self.get_inference_policy(device=self.env.device)
-    #     start_iter = 0
-    #     tot_iter = num_eval_iterations                
-    #     student_cmd_history = torch.zeros(tot_iter, self.num_steps_per_env, self.env.num_envs, 3,dtype=torch.float, device=self.device)
-    #     error_history = torch.zeros(tot_iter, self.num_steps_per_env, self.env.num_envs,2, dtype=torch.float, device=self.device)
-    #     for it in range(start_iter, tot_iter): 
-    #         lin_vel_xy_error = torch.zeros(self.num_steps_per_env, dtype=torch.float, device=self.device)           
-    #         ang_vel_xy_error = torch.zeros(self.num_steps_per_env, dtype=torch.float, device=self.device)           
-    #         with torch.inference_mode():
-    #             for rollout_step in range(self.num_steps_per_env):   
-    #                 if teacher_cmd_history is not None:
-    #                     obs['teacher'][:,-3:] = teacher_cmd_history[it, rollout_step, :, :].clone()
-    #                     obs['policy'][:,-3:] = teacher_cmd_history[it, rollout_step, :, :].clone()                    
-    #                 actions = student_policy(obs)
-    #                 student_cmd_history[it, rollout_step, :, :] = obs['policy'][:,-3:].clone()
-    #                 obs, rewards, dones, extras = self.env.step(actions.to(self.env.device))                
-
-    #                 cur_lin_vel = obs['policy'][:,:2].clone()
-    #                 cur_ang_vel = obs['policy'][:,5].clone()
-    #                 cmd_lin_vel = obs['policy'][:,-3:-1].clone()
-    #                 cmd_ang_vel = obs['policy'][:,-1].clone()
-
-    #                 lin_vel_diff = torch.norm(cmd_lin_vel - cur_lin_vel, dim=-1)
-    #                 ang_vel_diff = torch.norm(cmd_ang_vel.unsqueeze(dim=-1) - cur_ang_vel.unsqueeze(dim=-1), dim =-1)
-
-    #                 error_history[it, rollout_step, :,0] = lin_vel_diff.clone()
-    #                 error_history[it, rollout_step, :,1] = ang_vel_diff.clone()
-
-    #                 # lin_vel_err = lin_vel_diff[lin_vel_diff < lin_vel_diff.median()+lin_vel_diff.std()].mean()                    
-    #                 # ang_vel_err = ang_vel_diff[ang_vel_diff < ang_vel_diff.median()+ang_vel_diff.std()].mean()
-
-    #                 lin_vel_xy_error[rollout_step] = lin_vel_diff.mean()
-    #                 ang_vel_xy_error[rollout_step] =ang_vel_diff.mean()
-
-    #         self.writer.add_scalar("Eval_student/error_vel_xy", lin_vel_xy_error.mean().cpu().numpy().tolist(), it)
-    #         self.writer.add_scalar("Eval_student/error_vel_yaw", ang_vel_xy_error.mean().cpu().numpy().tolist(), it)
-
-
-
-    #     return student_cmd_history, error_history
-    
-
-
-
     def eval(self, num_eval_iterations: int, is_student = False, teacher_cmd_history = None) -> None:      
-        self._prepare_logging_writer()
+        # self._prepare_logging_writer()
         obs = self.env.get_observations().to(self.device)
         self.eval_mode()  # switch to train mode (for dropout for example)
         self.alg.policy.to(self.device)
@@ -331,16 +244,168 @@ class VelClonPolicyRunner(OnPolicyRunner):
                     error_history[it, rollout_step, :,0] = lin_vel_diff.clone()
                     error_history[it, rollout_step, :,1] = ang_vel_diff.clone()
 
-                    # lin_vel_err = lin_vel_diff[lin_vel_diff < lin_vel_diff.median()+lin_vel_diff.std()].mean()                    
-                    # ang_vel_err = ang_vel_diff[ang_vel_diff < ang_vel_diff.median()+ang_vel_diff.std()].mean()
 
                     lin_vel_xy_error[rollout_step] = lin_vel_diff.mean()
                     ang_vel_xy_error[rollout_step] =ang_vel_diff.mean()
 
-            self.writer.add_scalar("Eval_student/error_vel_xy", lin_vel_xy_error.mean().cpu().numpy().tolist(), it)
-            self.writer.add_scalar("Eval_student/error_vel_yaw", ang_vel_xy_error.mean().cpu().numpy().tolist(), it)
-
-
+            # self.writer.add_scalar("Eval_student/error_vel_xy", lin_vel_xy_error.mean().cpu().numpy().tolist(), it)
+            # self.writer.add_scalar("Eval_student/error_vel_yaw", ang_vel_xy_error.mean().cpu().numpy().tolist(), it)
 
         return cmd_history, error_history
     
+
+    def active_learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False) -> None:
+        # Initialize writer        
+        self._prepare_logging_writer()
+        # Check if teacher is loaded
+        if not self.alg.policy.loaded_teacher:
+            raise ValueError("Teacher model parameters not loaded. Please load a teacher model to distill.")
+
+        # Randomize initial episode lengths (for exploration)
+        if init_at_random_ep_len:
+            self.env.episode_length_buf = torch.randint_like(
+                self.env.episode_length_buf, high=int(self.env.max_episode_length)
+            )
+
+        # Start learning
+        obs = self.env.get_observations().to(self.device)
+        self.train_mode()  # switch to train mode (for dropout for example)
+
+        # Book keeping
+        ep_infos = []
+        rewbuffer = deque(maxlen=100)
+        lenbuffer = deque(maxlen=100)
+        cur_reward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
+        cur_episode_length = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
+
+        # Ensure all parameters are in-synced
+        if self.is_distributed:
+            print(f"Synchronizing parameters for rank {self.gpu_global_rank}...")
+            self.alg.broadcast_parameters()
+
+        # Start training
+        start_iter = self.current_learning_iteration
+        tot_iter = start_iter + num_learning_iterations
+        
+        self.save(os.path.join(self.log_dir, f"model_prior_train.pt"))
+        
+
+
+        for it in range(start_iter, tot_iter):            
+            start = time.time()
+            # Rollout            
+            with torch.inference_mode():
+                for rollout_step in range(self.num_steps_per_env):
+                    # Sample actions
+                    actions = self.alg.rollout(obs)
+                    # Step the environment
+                    obs, rewards, dones, extras = self.env.step(actions.to(self.env.device))
+                    # Move to device
+                    obs, rewards, dones = (obs.to(self.device), rewards.to(self.device), dones.to(self.device))
+                    # Process the step
+                    self.alg.process_env_step(obs, rewards, dones, extras)
+                    # Book keeping
+                    if self.log_dir is not None:
+                        if "episode" in extras:
+                            ep_infos.append(extras["episode"])
+                        elif "log" in extras:
+                            ep_infos.append(extras["log"])
+                        # Update rewards
+                        cur_reward_sum += rewards
+                        # Update episode length
+                        cur_episode_length += 1
+                        # Clear data for completed episodes
+                        new_ids = (dones > 0).nonzero(as_tuple=False)
+                        rewbuffer.extend(cur_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
+                        lenbuffer.extend(cur_episode_length[new_ids][:, 0].cpu().numpy().tolist())
+                        cur_reward_sum[new_ids] = 0
+                        cur_episode_length[new_ids] = 0
+                    
+       
+
+            stop = time.time()
+            collection_time = stop - start
+            start = stop
+            
+            self.alg.relabeling_velolicy_batch( env_cfg = self.env.cfg)
+         
+                    
+            loss_dict = self.alg.update()
+         
+            stop = time.time()
+            learn_time = stop - start
+            self.current_learning_iteration = it
+
+            if self.log_dir is not None and not self.disable_logs:
+                # Log information
+                self.log(locals())
+                # Save model
+                if it % self.save_interval == 0:
+                    self.save(os.path.join(self.log_dir, f"model_{it}.pt"))
+
+            # Clear episode infos
+            ep_infos.clear()
+            # Save code state
+            if it == start_iter and not self.disable_logs:
+                # Obtain all the diff files
+                git_file_paths = store_code_state(self.log_dir, self.git_status_repos)
+                # If possible store them to wandb or neptune
+                if self.logger_type in ["wandb", "neptune"] and git_file_paths:
+                    for path in git_file_paths:
+                        self.writer.save_file(path)
+
+            teacher_cmd_history, teacher_error_history = self.eval(1, is_student=False)
+            teacher_lin = teacher_error_history[..., 0].reshape(-1).cpu().numpy()
+            teacher_ang = teacher_error_history[..., 1].reshape(-1).cpu().numpy()
+
+            cmd_history, error_history = self.eval(1, is_student=True, teacher_cmd_history= teacher_cmd_history)
+            student_lin = error_history[..., 0].clone().reshape(-1).cpu().numpy()
+            student_ang = error_history[..., 1].clone().reshape(-1).cpu().numpy()
+            self.get_histogram_plot_lin_ang(it, teacher_lin, student_lin, teacher_ang, student_ang)
+            if self.is_active_sample:
+                gp_X = cmd_history.view(-1, self.gp_sampler.input_dim)
+                gp_y = error_history.view(-1, self.gp_sampler.output_dim)
+                self.gp_sampler.train(gp_X, gp_y)            
+
+            self.train_mode()
+
+        # Save the final model after training
+        if self.log_dir is not None and not self.disable_logs:
+            self.save(os.path.join(self.log_dir, f"model_{self.current_learning_iteration}.pt"))
+            
+
+
+
+    def get_histogram_plot_lin_ang(self,it_num, teacher_lin, student_lin, teacher_ang, student_ang):
+        # -----------------------
+        # Histogram Plot
+        # -----------------------
+        plt.figure(figsize=(10, 4))
+
+        # Linear
+        plt.subplot(1, 2, 1)
+        plt.hist(teacher_lin, bins=50, alpha=0.5, label="Teacher", density=True)
+        plt.hist(student_lin, bins=50, alpha=0.5, label="Student", density=True)
+        plt.xlabel("Linear velocity error")
+        plt.ylabel("Density")
+        plt.title("Linear Error Distribution")
+        plt.legend()
+
+        # Angular
+        plt.subplot(1, 2, 2)
+        plt.hist(teacher_ang, bins=50, alpha=0.5, label="Teacher", density=True)
+        plt.hist(student_ang, bins=50, alpha=0.5, label="Student", density=True)
+        plt.xlabel("Angular velocity error")
+        plt.ylabel("Density")
+        plt.title("Angular Error Distribution")
+        plt.legend()
+
+
+        
+        eval_log_dir =  os.path.join(self.log_dir, "eval_data", self.cfg['load_checkpoint'])        
+        if not os.path.exists(eval_log_dir):
+            os.makedirs(eval_log_dir)
+        
+        hist_path = os.path.join(eval_log_dir, f"epoch_{it_num}_error_histograms.png")
+        plt.savefig(hist_path, dpi=200, bbox_inches="tight")
+        plt.close()
