@@ -355,16 +355,17 @@ class VelClonPolicyRunner(OnPolicyRunner):
                         self.writer.save_file(path)
 
             teacher_cmd_history, teacher_error_history = self.eval(1, is_student=False)
-            teacher_lin = teacher_error_history[..., 0].reshape(-1).cpu().numpy()
-            teacher_ang = teacher_error_history[..., 1].reshape(-1).cpu().numpy()
-
             cmd_history, error_history = self.eval(1, is_student=True, teacher_cmd_history= teacher_cmd_history)
-            student_lin = error_history[..., 0].clone().reshape(-1).cpu().numpy()
-            student_ang = error_history[..., 1].clone().reshape(-1).cpu().numpy()
-            self.get_histogram_plot_lin_ang(it, teacher_lin, student_lin, teacher_ang, student_ang)
+          
+            teacher_cmd, teacher_lin, teacher_ang = self.get_err_statistics(teacher_cmd_history[0],teacher_error_history[0])
+            student_cmd, student_lin, student_ang = self.get_err_statistics(cmd_history[0],error_history[0])
+       
+            self.get_histogram_plot_lin_ang(it, teacher_lin.cpu().numpy(), student_lin.cpu().numpy(), teacher_ang.cpu().numpy(), student_ang.cpu().numpy())
+            self.get_scatter_lin_error_over_cmd_space_plot(it,teacher_cmd.cpu().numpy(),student_cmd.cpu().numpy(), teacher_lin.cpu().numpy(),student_lin.cpu().numpy())
+
             if self.is_active_sample:
-                gp_X = cmd_history.view(-1, self.gp_sampler.input_dim)
-                gp_y = error_history.view(-1, self.gp_sampler.output_dim)
+                gp_X = student_cmd # cmd_history.view(-1, self.gp_sampler.input_dim)
+                gp_y =  torch.cat([student_lin, student_lin],dim=-1) #  error_history.view(-1, self.gp_sampler.output_dim)
                 self.gp_sampler.train(gp_X, gp_y)            
 
             self.train_mode()
@@ -375,8 +376,101 @@ class VelClonPolicyRunner(OnPolicyRunner):
             
 
 
+    def get_err_statistics(self,cmd, err):
+        T, N, _ = cmd.shape
+
+        results = []  # list for storing results per environment
+
+        for env in range(N):
+            env_cmd = cmd[:, env, :]   # [T, 3]
+            env_err = err[:, env, :]   # [T, 2]
+
+            # Convert commands into tuples so we can group by them
+            unique_cmds, inverse_idx = torch.unique(env_cmd, dim=0, return_inverse=True)
+
+            env_result = []
+
+            for ci, command in enumerate(unique_cmds):
+                # Find all timesteps that use this command
+                mask = (inverse_idx == ci)   # [T]
+
+                # Extract linear & angular error
+                lin_err_values = env_err[mask, 0]
+                ang_err_values = env_err[mask, 1]
+
+                env_result.append({
+                    "command": command,                      # [3] tensor (cmd_x, cmd_y, yaw)
+                    "mean_linear_error": lin_err_values.mean().item(),
+                    "mean_angular_error": ang_err_values.mean().item(),
+                    "num_samples": mask.sum().item()
+                })
+
+            results.append(env_result)
+
+            
+        all_commands = []
+        all_lin = []
+        all_ang = []
+        all_num = []
+
+        for env_result in results:
+            for item in env_result:
+                all_commands.append(item["command"])                    # [3]
+                all_lin.append(item["mean_linear_error"])               # scalar
+                all_ang.append(item["mean_angular_error"])              # scalar
+                all_num.append(item["num_samples"])                     # scalar
+        all_commands = torch.stack(all_commands)
+        all_lin = torch.tensor(all_lin)
+        all_ang = torch.tensor(all_ang)
+      
+        return all_commands, all_lin.unsqueeze(-1), all_ang.unsqueeze(-1)
+
+            
+    def get_scatter_lin_error_over_cmd_space_plot(self,it_num,teacher_cmd_history,student_cmd_history, teacher_lin,student_lin):
+        t_cmd_x = teacher_cmd_history[:,0]
+        t_cmd_y = teacher_cmd_history[:,1]
+
+        s_cmd_x = student_cmd_history[:,0]
+        s_cmd_y = student_cmd_history[:,1]
+
+        # -----------------------
+        # TEACHER PLOT
+        # -----------------------
+        eval_hist_log_dir =  os.path.join(self.log_dir, "eval_data_hist", self.cfg['load_checkpoint'])        
+        if not os.path.exists(eval_hist_log_dir):
+            os.makedirs(eval_hist_log_dir)
+
+        plt.figure(figsize=(6, 5))
+        sc = plt.scatter(t_cmd_x, t_cmd_y, c=teacher_lin, s=5, cmap="viridis")
+        plt.colorbar(sc, label="Teacher linear error")
+        plt.xlabel("cmd_x")
+        plt.ylabel("cmd_y")
+        plt.title("Teacher: Linear Error over Command Space")
+        plt.grid(True, alpha=0.05)
+
+        teacher_path = os.path.join(eval_hist_log_dir, f"{it_num}_teacher_cmd_error_map.png")
+        plt.savefig(teacher_path, dpi=200, bbox_inches="tight")
+        plt.close()
+
+        # -----------------------
+        # STUDENT PLOT
+        # -----------------------
+        plt.figure(figsize=(6, 5))
+        sc = plt.scatter(s_cmd_x, s_cmd_y, c=student_lin, s=5, cmap="viridis")
+        plt.colorbar(sc, label="Student linear error")
+        plt.xlabel("cmd_x")
+        plt.ylabel("cmd_y")
+        plt.title("Student: Linear Error over Command Space")
+        plt.grid(True, alpha=0.05)
+
+        student_path = os.path.join(eval_hist_log_dir, f"{it_num}_student_cmd_error_map.png")
+        plt.savefig(student_path, dpi=200, bbox_inches="tight")
+        plt.close()
+
 
     def get_histogram_plot_lin_ang(self,it_num, teacher_lin, student_lin, teacher_ang, student_ang):
+      
+
         # -----------------------
         # Histogram Plot
         # -----------------------
