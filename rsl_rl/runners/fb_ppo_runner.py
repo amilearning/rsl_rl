@@ -61,10 +61,15 @@ class FBOnPolicyRunner:
         # Note: We only log from the process with rank 0 (main process)
         self.disable_logs = self.is_distributed and self.gpu_global_rank != 0
 
-
+    def train_fb(self):                
+        for _ in range(self.fb_alg_cfg['num_agent_updates']):
+            metrics = self.fb_alg.update()
 
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False) -> None:
         # Initialize writer
+        if self.cfg["resume"]:
+            self.train_fb()
+        
         self._prepare_logging_writer()
 
         # Randomize initial episode lengths (for exploration)
@@ -327,6 +332,7 @@ class FBOnPolicyRunner:
             self.current_learning_iteration = loaded_dict["iter"]
         
         self.fb_alg.storage.load_latest(os.path.dirname(path))
+        a = self.fb_alg.storage.sample(2)
         return loaded_dict["infos"]
 
     def get_inference_policy(self, device: str | None = None) -> callable:
