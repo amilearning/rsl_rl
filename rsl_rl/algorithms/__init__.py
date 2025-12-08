@@ -8,5 +8,6 @@
 from .cloning import Cloning
 from .distillation import Distillation
 from .ppo import PPO
+from .forwardbackward import FBAlgorithm
 
-__all__ = ["PPO", "Distillation", "Cloning"]
+__all__ = ["PPO", "Distillation", "Cloning", "FBAlgorithm"]

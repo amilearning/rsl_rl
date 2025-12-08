@@ -140,6 +140,8 @@ class PPO:
             self.device,
         )
 
+
+
     def act(self, obs: TensorDict) -> torch.Tensor:
         if self.policy.is_recurrent:
             self.transition.hidden_states = self.policy.get_hidden_states()

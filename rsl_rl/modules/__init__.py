@@ -13,6 +13,7 @@ from .student_teacher import StudentTeacher
 from .student_teacher_bc import BCStudentTeacher
 from .student_teacher_recurrent import StudentTeacherRecurrent
 from .symmetry import resolve_symmetry_config
+from .fb_actor import FBActor, ForwardMap, BackwardMap
 
 __all__ = [
     "ActorCritic",
@@ -24,4 +25,7 @@ __all__ = [
     "StudentTeacherRecurrent",
     "resolve_rnd_config",
     "resolve_symmetry_config",
+    "FBActor",
+    "ForwardMap",
+    "BackwardMap",
 ]
