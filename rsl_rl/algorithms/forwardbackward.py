@@ -87,6 +87,7 @@ class FBAlgorithm:
         device: str = "cuda",        
     ) -> None:
         # Device-related parameters
+        self.metrics: tp.Dict[str, float] = {}        
         self.log_dir = log_dir
         self.cfg = cfg
         self.alg_cfg = cfg['fb_algorithm']
@@ -139,8 +140,8 @@ class FBAlgorithm:
         self.num_mini_batches = num_mini_batches
         self.learning_rate = learning_rate
 
-        self.num_updates = 0
-        self.global_step = 0
+        
+        
 
 
     def init_storage(
@@ -159,6 +160,7 @@ class FBAlgorithm:
             obs,
             actions_shape
         )
+        
         
     def update_transition_pre(self,obs, actions):        
         self.transition.observations = obs
@@ -237,13 +239,16 @@ class FBAlgorithm:
 
         return z
 
+    
+    
+    
     def update(self) -> dict[str, float]:
-        self.num_updates += 1
+        
         mean_behavior_loss = 0
         loss = 0
         cnt = 0
         
-        metrics: tp.Dict[str, float] = {}
+        
 
         batch = self.storage.sample(self.alg_cfg["batch_size"])        
 
@@ -255,10 +260,140 @@ class FBAlgorithm:
         next_obs = batch["next_obs"].to(self.device)
         value_goals = batch["value_goals"].to(self.device)
         actor_goals = batch["actor_goals"].to(self.device)
-        z = self.sample_mixed_z(actor_goals)
+        z = self.sample_mixed_z(actor_goals).detach()
            
         if not z.shape[-1] == self.policy_cfg["z_dim"]:
             raise RuntimeError("There's something wrong with the logic here")
+    
+    
+        ''' 
+        Update FB models   
+        '''
+        
+        
+        self.metrics.update(self.update_fb(cur_obs, cur_action,discount,next_obs, value_goals,z))
+        self.metrics.update(self.update_policy(cur_obs, z))
+        
+        self.soft_update_params(self.forward_net, self.forward_target_net,
+                                 self.alg_cfg["fb_target_tau"])
+        self.soft_update_params(self.backward_net, self.backward_target_net,
+                                 self.alg_cfg["fb_target_tau"])
+        
+        return self.metrics
+            
+    def update_fb(self,
+        cur_obs: torch.Tensor,
+        cur_action: torch.Tensor,
+        discount: torch.Tensor,
+        next_obs: torch.Tensor,
+        value_goals: torch.Tensor,
+        z: torch.Tensor):
+        metrics: tp.Dict[str, float] = {}        
+        # compute target successor measure
+        with torch.no_grad():
+            if self.policy_cfg["boltzmann"]:
+                dist = self.policy(next_obs, z)
+                next_action = dist.sample()
+            else:
+                stddev = float(self.policy_cfg["stddev_schedule"])
+                dist = self.policy(next_obs, z, stddev)
+                next_action = dist.sample(clip=self.policy_cfg["stddev_clip"])
+            target_F1, target_F2 = self.forward_target_net(next_obs, z, next_action)  # batch x z_dim
+            target_B = self.backward_target_net(value_goals)  # batch x z_dim
+
+            
+            target_M1 = torch.einsum('bsd, btd -> bst', target_F1, target_B)  # batch x batch
+            target_M2 = torch.einsum('bsd, btd -> bst', target_F2, target_B)  # batch x batch
+            target_M = torch.min(target_M1, target_M2)
+            
+            
+        # compute FB loss
+        F1, F2 = self.forward_net(cur_obs, z, cur_action)
+        B = self.backward_net(value_goals)
+  
+        
+        
+        M1 = torch.einsum('bsd, btd -> bst', F1, B)  # batch x batch
+        M2 = torch.einsum('bsd, btd -> bst', F2, B)  # batch x batch
+        I = torch.eye(M1.shape[1],M1.shape[2], device=M1.device)
+        I = I.repeat(M1.shape[0], 1,1)
+        off_diag = ~I.bool()
+        fb_offdiag: tp.Any = 0.5 * sum((M - discount * target_M)[off_diag].pow(2).mean() for M in [M1, M2])
+        fb_diag: tp.Any = -sum(torch.diagonal(M, dim1=1, dim2=2).mean() for M in [M1, M2])
+        fb_loss = fb_offdiag + fb_diag
+
+        # Target M for continuous actor
+        # ORTHONORMALITY LOSS FOR BACKWARD EMBEDDING
+
+        # Cov = torch.matmul(B, B.T)
+        Cov = torch.matmul(B, B.transpose(-1, -2))        
+        orth_loss_diag = - 2 * torch.diagonal(Cov, dim1=1, dim2=2).mean()
+        orth_loss_offdiag = Cov[off_diag].pow(2).mean()
+        orth_loss = orth_loss_offdiag + orth_loss_diag
+        fb_loss += self.alg_cfg["ortho_coef"] * orth_loss
+        
+      
+
+        self.fb_opt.zero_grad(set_to_none=True)
+        fb_loss.backward()
+        self.fb_opt.step()      
+          
+        metrics['target_M'] = target_M.mean().item()
+        metrics['M1'] = M1.mean().item()
+        metrics['F1'] = F1.mean().item()
+        metrics['B'] = B.mean().item()
+        metrics['B_norm'] = torch.norm(B, dim=-1).mean().item()
+        metrics['z_norm'] = torch.norm(z, dim=-1).mean().item()
+        metrics['fb_loss'] = fb_loss.item()
+        metrics['fb_diag'] = fb_diag.item()
+        metrics['fb_offdiag'] = fb_offdiag.item()
+        metrics['orth_loss'] = orth_loss.item()
+        metrics['orth_loss_diag'] = orth_loss_diag.item()
+        metrics['orth_loss_offdiag'] = orth_loss_offdiag.item()
+        # eye_diff = torch.matmul(B.T, B) / B.shape[0] - torch.eye(B.shape[1], device=B.device)
+        # metrics['orth_linf'] = torch.max(torch.abs(eye_diff)).item()
+        # metrics['orth_l2'] = eye_diff.norm().item() / math.sqrt(B.shape[1])
+        if isinstance(self.fb_opt, torch.optim.Adam):
+            metrics["fb_opt_lr"] = self.fb_opt.param_groups[0]["lr"]
+  
+      
+        return metrics
+    
+    def soft_update_params(self,net, target_net, tau) -> None:
+        for param, target_param in zip(net.parameters(), target_net.parameters()):
+            target_param.data.copy_(tau * param.data +
+                                    (1 - tau) * target_param.data)
+            
+    def update_policy(self,cur_obs: torch.Tensor, z: torch.Tensor):
+        metrics: tp.Dict[str, float] = {}        
+        if self.policy_cfg["boltzmann"]:
+            dist = self.policy(cur_obs, z)
+            action = dist.rsample()
+        else:
+            stddev = self.policy_cfg["stddev_schedule"]
+            dist = self.policy(cur_obs, z, stddev)
+            action = dist.sample(clip=self.policy_cfg["stddev_clip"])
+
+        log_prob = dist.log_prob(action).sum(-1, keepdim=False)
+        F1, F2 = self.forward_net(cur_obs, z, action)
+        Q1 = torch.einsum('bsd, bsd -> bs', F1, z)
+        Q2 = torch.einsum('bsd, bsd -> bs', F2, z)
+   
+        Q = torch.min(Q1, Q2)
+        actor_loss = (self.policy_cfg["temp"] * log_prob - Q).mean() if self.policy_cfg["boltzmann"] else -Q.mean()
+
+        # optimize actor
+        self.policy_opt.zero_grad(set_to_none=True)
+        actor_loss.backward()
+        self.policy_opt.step()
+
+        metrics['actor_loss'] = actor_loss.item()
+        metrics['q'] = Q.mean().item()            
+        metrics['actor_logprob'] = log_prob.mean().item()
+            
+        return metrics
+    
+    
             
         # for epoch in range(self.num_learning_epochs):
         #     self.policy.reset(hidden_states=self.last_hidden_states)
@@ -300,5 +435,38 @@ class FBAlgorithm:
         # # Construct the loss dictionary
         # loss_dict = {"behavior": mean_behavior_loss}
 
-        return loss_dict
+        return z
 
+
+    def get_state(self) -> dict:
+        """Return everything needed to resume training."""
+        return {
+            "policy": self.policy.state_dict(),
+            "forward_net": self.forward_net.state_dict(),
+            "forward_target_net": self.forward_target_net.state_dict(),
+            "backward_net": self.backward_net.state_dict(),
+            "backward_target_net": self.backward_target_net.state_dict(),
+            "policy_opt": self.policy_opt.state_dict(),
+            "fb_opt": self.fb_opt.state_dict(),                        
+            "cfg": self.cfg,  # optional but handy
+            "metrics": self.metrics, 
+            "log_dir": self.log_dir,
+        }
+        
+        
+    def load_state(self, state: dict, load_optim: bool = True) -> None:
+        """Load everything from a state dict created by get_state()."""
+
+        self.policy.load_state_dict(state["policy"])
+        self.forward_net.load_state_dict(state["forward_net"])
+        self.backward_net.load_state_dict(state["backward_net"])
+        self.forward_target_net.load_state_dict(state["forward_target_net"])
+        self.backward_target_net.load_state_dict(state["backward_target_net"])
+
+        if load_optim:
+            self.policy_opt.load_state_dict(state["policy_opt"])
+            self.fb_opt.load_state_dict(state["fb_opt"])
+
+        
+        
+        

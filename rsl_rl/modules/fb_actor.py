@@ -159,7 +159,7 @@ class FBActor(nn.Module):
         self.actor_hidden_dims = policy_cfg['actor_hidden_dims']        
         self.preprocess = True
         
-        feature_dim = 50
+        feature_dim = 150
         hidden_dim = self.actor_hidden_dims[-1]
 
         self.obs_net = mlp(self.obs_dim, hidden_dim, "ntanh", feature_dim, "irelu")

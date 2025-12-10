@@ -10,6 +10,7 @@ import statistics
 import time
 import torch
 import warnings
+import typing as tp
 from collections import deque
 from tensordict import TensorDict
 
@@ -63,14 +64,17 @@ class FBOnPolicyRunner:
 
     def train_fb(self):                
         for _ in range(self.fb_alg_cfg['num_agent_updates']):
-            metrics = self.fb_alg.update()
+            self.fb_alg.update()
 
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False) -> None:
         # Initialize writer
+
+        self._prepare_logging_writer()
+        
+        
         if self.cfg["resume"]:
             self.train_fb()
         
-        self._prepare_logging_writer()
 
         # Randomize initial episode lengths (for exploration)
         if init_at_random_ep_len:
@@ -101,6 +105,10 @@ class FBOnPolicyRunner:
             print(f"Synchronizing parameters for rank {self.gpu_global_rank}...")
             self.alg.broadcast_parameters()
 
+        
+        self.save(os.path.join(self.log_dir, "model_init.pt"))
+        
+        
         # Start training
         start_iter = self.current_learning_iteration
         tot_iter = start_iter + num_learning_iterations
@@ -163,10 +171,19 @@ class FBOnPolicyRunner:
             stop = time.time()
             learn_time = stop - start
             self.current_learning_iteration = it
+            
+            fb_start = time.time()
+            if self.cfg["resume"] or it > self.fb_alg_cfg["num_prior_data_collect_epoch"]:            
+                self.train_fb()
+            fb_stop = time.time()            
+            train_fb_time = fb_stop - fb_start
+            
+            
 
             if self.log_dir is not None and not self.disable_logs:
                 # Log information
                 self.log(locals())
+                self.fb_log_metrics(locals())
                 # Save model
                 if it % self.save_interval == 0:
                     self.save(os.path.join(self.log_dir, f"model_{it}.pt"))
@@ -186,6 +203,29 @@ class FBOnPolicyRunner:
         if self.log_dir is not None and not self.disable_logs:
             self.save(os.path.join(self.log_dir, f"model_{self.current_learning_iteration}.pt"))
 
+    def fb_log_metrics(self, locs: dict, prefix: str = "FB") -> None:
+        """Log FB + actor metrics stored in self.metrics to a SummaryWriter-like `writer`."""
+        step = locs["it"]        
+        m = self.fb_alg.metrics
+        self.writer.add_scalar(f"{prefix}/target_M", m.get("target_M", 0.0), step)
+        self.writer.add_scalar(f"{prefix}/M1", m.get("M1", 0.0), step)
+        self.writer.add_scalar(f"{prefix}/F1", m.get("F1", 0.0), step)
+        self.writer.add_scalar(f"{prefix}/B", m.get("B", 0.0), step)
+        self.writer.add_scalar(f"{prefix}/B_norm", m.get("B_norm", 0.0), step)
+        self.writer.add_scalar(f"{prefix}/z_norm", m.get("z_norm", 0.0), step)
+        self.writer.add_scalar(f"{prefix}/fb_loss", m.get("fb_loss", 0.0), step)
+        self.writer.add_scalar(f"{prefix}/fb_diag", m.get("fb_diag", 0.0), step)
+        self.writer.add_scalar(f"{prefix}/fb_offdiag", m.get("fb_offdiag", 0.0), step)
+        self.writer.add_scalar(f"{prefix}/orth_loss", m.get("orth_loss", 0.0), step)
+        self.writer.add_scalar(f"{prefix}/orth_loss_diag", m.get("orth_loss_diag", 0.0), step)
+        self.writer.add_scalar(f"{prefix}/orth_loss_offdiag", m.get("orth_loss_offdiag", 0.0), step)        
+        self.writer.add_scalar(f"{prefix}/actor_loss", m.get("actor_loss", 0.0), step)
+        self.writer.add_scalar(f"{prefix}/q", m.get("q", 0.0), step)
+        self.writer.add_scalar(f"{prefix}/actor_logprob", m.get("actor_logprob", 0.0), step)
+        
+   
+        
+        
     def log(self, locs: dict, width: int = 80, pad: int = 35) -> None:
         # Compute the collection size
         collection_size = self.num_steps_per_env * self.env.num_envs * self.gpu_world_size
@@ -193,7 +233,7 @@ class FBOnPolicyRunner:
         self.tot_timesteps += collection_size
         self.tot_time += locs["collection_time"] + locs["learn_time"]
         iteration_time = locs["collection_time"] + locs["learn_time"]
-
+        fb_train_time = locs["train_fb_time"]
         # Log episode information
         ep_string = ""
         if locs["ep_infos"]:
@@ -287,6 +327,7 @@ class FBOnPolicyRunner:
             f"""{"-" * width}\n"""
             f"""{"Total timesteps:":>{pad}} {self.tot_timesteps}\n"""
             f"""{"Iteration time:":>{pad}} {iteration_time:.2f}s\n"""
+            f"""{"FB train time:":>{pad}} {fb_train_time:.2f}s\n"""
             f"""{"Time elapsed:":>{pad}} {time.strftime("%H:%M:%S", time.gmtime(self.tot_time))}\n"""
             f"""{"ETA:":>{pad}} {
                 time.strftime(
@@ -302,8 +343,9 @@ class FBOnPolicyRunner:
         print(log_string)
 
     def save(self, path: str, infos: dict | None = None) -> None:
-        # Save model
+        # Save model       
         saved_dict = {
+            "fb_alg_state": self.fb_alg.get_state(),
             "model_state_dict": self.alg.policy.state_dict(),
             "optimizer_state_dict": self.alg.optimizer.state_dict(),
             "iter": self.current_learning_iteration,
@@ -330,9 +372,11 @@ class FBOnPolicyRunner:
         # Load current learning iteration
         if resumed_training:
             self.current_learning_iteration = loaded_dict["iter"]
-        
+            
+        if "fb_alg_state" in loaded_dict:
+            self.fb_alg.load_state(loaded_dict["fb_alg_state"], load_optim=load_optimizer)        
         self.fb_alg.storage.load_latest(os.path.dirname(path))
-        a = self.fb_alg.storage.sample(2)
+        
         return loaded_dict["infos"]
 
     def get_inference_policy(self, device: str | None = None) -> callable:
