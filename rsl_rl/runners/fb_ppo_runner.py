@@ -32,6 +32,8 @@ class FBOnPolicyRunner:
         self.fb_policy_cfg = train_cfg["fb_policy"]
         self.device = device
         self.env = env
+        
+        self.prev_data_path = None 
 
         # Check if multi-GPU is enabled
         self._configure_multi_gpu()
@@ -62,9 +64,24 @@ class FBOnPolicyRunner:
         # Note: We only log from the process with rank 0 (main process)
         self.disable_logs = self.is_distributed and self.gpu_global_rank != 0
 
-    def train_fb(self):                
-        for _ in range(self.fb_alg_cfg['num_agent_updates']):
+    def train_fb(self):
+        num_updates = self.fb_alg_cfg['num_agent_updates']
+        for train_it in range(num_updates):
+            # 1. Run one FB update
             self.fb_alg.update()
+            # # 2. Every 20 iterations, optionally reload a random offline buffer
+            # if (train_it % 20 == 0) and (self.prev_data_path is not None):
+            #     load_path = os.path.dirname(self.prev_data_path)
+            #     self.fb_alg.storage.load_random(load_path)
+
+
+    # def train_fb(self):                
+        
+    #     for train_it ,_ in enumerate(range(self.fb_alg_cfg['num_agent_updates'])):
+    #         self.fb_alg.update()
+    #         if train_it /20 ==0 
+    #             if self.prev_data_path is not None:
+    #             self.fb_alg.storage.load_random(os.path.dirname(self.prev_data_path))
 
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False) -> None:
         # Initialize writer
@@ -72,8 +89,17 @@ class FBOnPolicyRunner:
         self._prepare_logging_writer()
         
         
-        if self.cfg["resume"]:
-            self.train_fb()
+        # if self.cfg["resume"]:
+            # num_updates = self.fb_alg_cfg['num_agent_updates']
+            # for it in range(num_updates):
+            #     # 1. Run one FB update
+            #     self.fb_alg.update()                
+            #     # 2. Every 20 iterations, optionally reload a random offline buffer
+            #     if (it % 500 == 0) and (self.prev_data_path is not None):
+            #         load_path = os.path.dirname(self.prev_data_path)
+            #         self.fb_alg.storage.load_random(load_path)                    
+            #         self.fb_log_metrics(locals())
+            # self.fb_alg.storage.load_latest(load_path)
         
 
         # Randomize initial episode lengths (for exploration)
@@ -106,19 +132,32 @@ class FBOnPolicyRunner:
             self.alg.broadcast_parameters()
 
         
-        self.save(os.path.join(self.log_dir, "model_init.pt"))
+        self.save(os.path.join(self.log_dir, "model_0.pt"))
         
         
         # Start training
         start_iter = self.current_learning_iteration
         tot_iter = start_iter + num_learning_iterations
+        script_global_it = 0
         for it in range(start_iter, tot_iter):
+            script_global_it+=1
             start = time.time()
             # Rollout
             with torch.inference_mode():
                 for _ in range(self.num_steps_per_env):
-                    # Sample actions
-                    actions = self.alg.act(obs)
+                    
+                    ppo_actions = self.alg.act(obs)                                                    
+                        
+                    if it < self.fb_alg_cfg["num_prior_data_collect_epoch"]+1:                                                              
+                        actions = ppo_actions
+                    else:
+                        fb_actions = self.fb_alg.act(obs, is_eval = False)                        
+                        prob_ppo_action = max(0.0, 1.0 - 0.1 * script_global_it)                                  
+                        ppo_action_mask = torch.rand(ppo_actions.size(0), 1, device=ppo_actions.device) < prob_ppo_action                    
+                        actions = torch.where(ppo_action_mask, ppo_actions, fb_actions)
+                        
+                        
+                    
                     self.fb_alg.update_transition_pre(obs, actions)
                     
                     # Step the environment
@@ -173,8 +212,9 @@ class FBOnPolicyRunner:
             self.current_learning_iteration = it
             
             fb_start = time.time()
-            if self.cfg["resume"] or it > self.fb_alg_cfg["num_prior_data_collect_epoch"]:            
-                self.train_fb()
+            if self.cfg["resume"] or it > self.fb_alg_cfg["num_prior_data_collect_epoch"]: #                              
+                if script_global_it > 10:
+                    self.train_fb()
             fb_stop = time.time()            
             train_fb_time = fb_stop - fb_start
             
@@ -375,7 +415,9 @@ class FBOnPolicyRunner:
             
         if "fb_alg_state" in loaded_dict:
             self.fb_alg.load_state(loaded_dict["fb_alg_state"], load_optim=load_optimizer)        
-        self.fb_alg.storage.load_latest(os.path.dirname(path))
+        # self.fb_alg.storage.load_latest(os.path.dirname(path))
+        self.prev_data_path = path
+        
         
         return loaded_dict["infos"]
 

@@ -140,7 +140,11 @@ class PPO:
             self.device,
         )
 
-
+    def post_act_update(self,actions):
+        self.transition.actions = actions
+        self.transition.actions_log_prob = self.policy.get_actions_log_prob(actions).detach()
+        self.transition.action_mean = self.policy.action_mean.detach()
+        self.transition.action_sigma = self.policy.action_std.detach()
 
     def act(self, obs: TensorDict) -> torch.Tensor:
         if self.policy.is_recurrent:

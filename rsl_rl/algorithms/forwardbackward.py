@@ -142,8 +142,6 @@ class FBAlgorithm:
 
         
         
-
-
     def init_storage(
         self,
         training_type: str,
@@ -177,33 +175,61 @@ class FBAlgorithm:
             net.train(training)
             
 
-    def init_meta(self) -> MetaDict:        
-        z = self.sample_z(1)
-        z = z.squeeze().numpy()
-        meta = OrderedDict()
-        meta['z'] = z
-        return meta
+    def get_goal_z(self, obs):        
+        
+        goal_states = obs['policy'].clone()
+        goal_states[:,-4:] =  torch.randn_like(goal_states[:, -4:]) * 0.01
+        # base_lin_vel
+        goal_states[:,:3] =  torch.randn_like(goal_states[:, :3]) * 0.01
+        # projected_gravity
+        # goal_states[:,3] =  torch.randn_like(goal_states[:, 3]) * 0.001
+        # goal_states[:,4] =  torch.randn_like(goal_states[:, 4]) * 0.001
+        goal_states[:,5] =  -1.0+torch.rand_like(goal_states[:, 5]) * 0.001
+        similar_obs = self.storage.find_similar_obs(goal_states)
+        
+        with torch.no_grad():            
+            z = self.backward_net(similar_obs)        
+            z = math.sqrt(self.z_dim) * F.normalize(z, dim=-1)        
+              
+        return z
     
-    def update_meta(
-        self,
-        meta: MetaDict,
-        global_step: int,
-    ) -> MetaDict:
-        if global_step % self.update_z_every_step == 0:
-            return self.init_meta()
-        return meta
+    # def init_meta(self) -> MetaDict:        
+    #     z = self.sample_z(1)
+    #     z = z.squeeze().numpy()
+    #     meta = OrderedDict()
+    #     meta['z'] = z
+    #     return meta
+    
+    # def update_meta(
+    #     self,
+    #     meta: MetaDict,
+    #     global_step: int,
+    # ) -> MetaDict:
+    #     if global_step % self.update_z_every_step == 0:
+    #         return self.init_meta()
+    #     return meta
     
   
-    def act(self, obs: TensorDict, eval_mode = False) -> torch.Tensor:
-        # Compute the actions
-        self.transition.observations = obs
+    def act(self, obs: TensorDict, is_eval= False) -> torch.Tensor:
+        # Compute the actions        
+
+        goal_z = self.get_goal_z(obs)
+                    
+        # dist = self.network.select('actor')(observations, latent_z, temperature=temperature)
+        # actions = dist.sample(seed=seed)
+        # actions = jnp.clip(actions, -1, 1
+        obs_tensor = obs["policy"].to(self.device)
+        stddev = self.policy_cfg["stddev_schedule"]        
+        dist = self.policy(obs_tensor, goal_z, stddev)
         
-        self.transition.actions = self.policy.act(obs)
-        # self.transition.privileged_actions = self.policy.evaluate(obs)
-        # Record the observations
         
+        if is_eval:
+            action = dist.mean
+        else:            
+            action = dist.sample()
+        # action = dist.sample()
         
-        return self.transition.actions
+        return action
 
 
     def sample_z(self, batch_size, env_size, device: str = "cuda"):
@@ -231,9 +257,9 @@ class FBAlgorithm:
         z = self.sample_z(batch_size, env_size)
         
         b_goals = self.backward_net(actor_goals)
-
+        b_goals = math.sqrt(self.z_dim) * F.normalize(b_goals, dim=-1)
         mask = torch.rand(batch_size,env_size,device=self.device) < self.alg_cfg["z_mix_ratio"]   # bool tensor
-        mask = mask.unsqueeze(-1) 
+        mask = mask.unsqueeze(-1).repeat(1,1,b_goals.shape[-1]) 
         
         z = torch.where(mask, z, b_goals)        
 

@@ -14,7 +14,7 @@ from rsl_rl.utils import split_and_pad_trajectories
 import os
 from datetime import datetime
 import glob
-
+import random 
 class FBRolloutStorage:
     class Transition:
         def __init__(self) -> None:
@@ -109,51 +109,279 @@ class FBRolloutStorage:
         print(f"[FBRolloutStorage] Saved {self.step} transitions → {file_path}")
         
         
-            
-    def load_latest(self, load_path):
-        """Load the most recent saved buffer from disk into memory."""
-        save_dir = os.path.join(load_path, "offdata")
-
-        if not os.path.exists(save_dir):
-            print(f"[FBRolloutStorage] No offdata folder found at {save_dir}")
-            return False
-
-        # Find all buffer files
-        files = glob.glob(os.path.join(save_dir, "buffer_*.pt"))
-        if len(files) == 0:
-            print(f"[FBRolloutStorage] No buffer files found in {save_dir}")
-            return False
-
-        # Pick the most recent one by timestamp
-        latest_file = max(files, key=os.path.getmtime)
-
-        print(f"[FBRolloutStorage] Loading latest buffer: {latest_file}")
-        data = torch.load(latest_file, weights_only=False, map_location="cpu")
+    def _load_from_data_dict(self, data, source_desc: str = "") -> bool:
+        """Internal helper: load a saved buffer dict into memory (with env subsampling)."""
 
         size = data["size"]
 
-        # Resize the in-memory buffer if needed
+        # Check buffer size
         if size > self.max_buffer_size:
             raise ValueError(
                 f"Saved buffer size {size} exceeds current max_buffer_size {self.max_buffer_size}"
             )
 
-        obs_td = TensorDict(data["observations"], batch_size=[size, self.num_envs], device=self.device)
-        self.observations[:size].copy_(obs_td)
-        self.actions[:size].copy_(data["actions"])
-        self.rewards[:size].copy_(data["rewards"])
-        self.dones[:size].copy_(data["dones"])
-        self.time_outs[:size].copy_(data["time_outs"])
-     
-        # Update step counter
+        # Shapes: [T, E_stored, ...]
+        T, E_stored, D = data["observations"]["policy"].shape
+        E_target = self.num_envs
+
+        if E_target > E_stored:
+            raise ValueError(
+                f"Requested num_envs={E_target} but buffer only has {E_stored} envs."
+            )
+
+        # 1) Sample env indices (same for all tensors)
+        env_idx = torch.randperm(E_stored)[:E_target]
+
+        # 2) Slice observations (dict of tensors)
+        obs_dict = data["observations"]
+        sampled_obs = {
+            key: obs[:, env_idx].to(self.device)
+            for key, obs in obs_dict.items()
+        }
+
+        # 3) Slice actions / rewards / dones / timeouts
+        sampled_actions  = data["actions"][:, env_idx].to(self.device)
+        sampled_rewards  = data["rewards"][:, env_idx].to(self.device)
+        sampled_dones    = data["dones"][:, env_idx].to(self.device)
+        sampled_timeouts = data["time_outs"][:, env_idx].to(self.device)
+
+        # 4) Copy into in-memory buffers
+        #    (assumes buffer is pre-allocated to at least T in time dimension)
+        self.observations[:T].copy_(sampled_obs)
+        self.actions[:T].copy_(sampled_actions)
+        self.rewards[:T].copy_(sampled_rewards)
+        self.dones[:T].copy_(sampled_dones)
+        self.time_outs[:T].copy_(sampled_timeouts)
+
+        # 5) Update step counter
         self.step = size
 
-        print(f"[FBRolloutStorage] Successfully loaded {size} transitions.")
+        tag = f" from {source_desc}" if source_desc else ""
+        print(f"[FBRolloutStorage] Successfully loaded {size} transitions{tag}.")
 
         return True
 
+    def _get_buffer_files(self, load_path):
+        """Internal helper: return list of all buffer_*.pt files under load_path/offdata."""
+        save_dir = os.path.join(load_path, "offdata")
+
+        if not os.path.exists(save_dir):
+            print(f"[FBRolloutStorage] No offdata folder found at {save_dir}")
+            return None, []
+
+        files = glob.glob(os.path.join(save_dir, "buffer_*.pt"))
+        if len(files) == 0:
+            print(f"[FBRolloutStorage] No buffer files found in {save_dir}")
+            return save_dir, []
+
+        return save_dir, files
+
+    def load_latest(self, load_path):
+        """Load the most recent saved buffer from disk into memory."""
+        save_dir, files = self._get_buffer_files(load_path)
+        if save_dir is None or len(files) == 0:
+            return False
+
+        # Pick the most recent file by timestamp
+        latest_file = max(files, key=os.path.getmtime)
+        print(f"[FBRolloutStorage] Loading latest buffer: {latest_file}")
+
+        data = torch.load(latest_file, weights_only=False, map_location="cpu")
+
+        return self._load_from_data_dict(data, source_desc=latest_file)
+
+    def load_random(self, load_path):
+        """Load a random saved buffer file from disk into memory."""
+        save_dir, files = self._get_buffer_files(load_path)
+        if save_dir is None or len(files) == 0:
+            return False
+
+        # Pick a random buffer file
+        random_file = random.choice(files)
+        print(f"[FBRolloutStorage] Loading random buffer: {random_file}")
+
+        data = torch.load(random_file, weights_only=False, map_location="cpu")
+
+        return self._load_from_data_dict(data, source_desc=random_file)            
+    # def load_latest(self, load_path):
+    #     """Load the most recent saved buffer from disk into memory."""
+    #     save_dir = os.path.join(load_path, "offdata")
+
+    #     if not os.path.exists(save_dir):
+    #         print(f"[FBRolloutStorage] No offdata folder found at {save_dir}")
+    #         return False
+
+    #     # Find all buffer files
+    #     files = glob.glob(os.path.join(save_dir, "buffer_*.pt"))
+    #     if len(files) == 0:
+    #         print(f"[FBRolloutStorage] No buffer files found in {save_dir}")
+    #         return False
+
+    #     # Pick the most recent one by timestamp
+    #     latest_file = max(files, key=os.path.getmtime)
+
+    #     print(f"[FBRolloutStorage] Loading latest buffer: {latest_file}")
+    #     data = torch.load(latest_file, weights_only=False, map_location="cpu")
+
+    #     size = data["size"]
+
+    #     # Resize the in-memory buffer if needed
+    #     if size > self.max_buffer_size:
+    #         raise ValueError(
+    #             f"Saved buffer size {size} exceeds current max_buffer_size {self.max_buffer_size}"
+    #         )
+
+    #     # ===== 1. Get shapes =====
+    #     T, E_stored, D = data["observations"]["policy"].shape
+    #     E_target = self.num_envs
+
+    #     # ===== 2. Sample environment indices =====
+    #     env_idx = torch.randperm(E_stored)[:E_target]
+
+    #     # ===== 3. Slice observations (dict) =====
+    #     obs_dict = data["observations"]
+    #     sampled_obs = {
+    #         key: obs[:, env_idx].to(self.device)
+    #         for key, obs in obs_dict.items()
+    #     }
+
+    #     # ===== 4. Slice actions / rewards / dones / timeouts =====
+    #     sampled_actions  = data["actions"][:, env_idx].to(self.device)
+    #     sampled_rewards  = data["rewards"][:, env_idx].to(self.device)
+    #     sampled_dones    = data["dones"][:, env_idx].to(self.device)
+    #     sampled_timeouts = data["time_outs"][:, env_idx].to(self.device)
+
+    #     # ===== 5. Copy to replay buffer =====
+    #     # Observations: TensorDict expects dict-like values
+    #     self.observations[:T].copy_(sampled_obs)
+
+    #     self.actions[:T].copy_(sampled_actions)
+    #     self.rewards[:T].copy_(sampled_rewards)
+    #     self.dones[:T].copy_(sampled_dones)
+    #     self.time_outs[:T].copy_(sampled_timeouts)
+        
+        
+    #     # T, E_stored, D = data["observations"]["policy"].shape
+    #     # E_target = self.num_envs
+
+    #     # # Randomly select env indices without replacement
+    #     # env_idx = torch.randperm(E_stored)[:E_target]
+    #     # obs_dict = data["observations"]
+    #     # sampled_obs = {
+    #     #     key: obs[:, env_idx].to(self.device)
+    #     #     for key, obs in obs_dict.items()
+    #     # }
+        
+    #     # # obs_td = TensorDict(data["observations"], batch_size=[size, self.num_envs], device=self.device)
+    #     # self.observations[:size].copy_(sampled_obs)
+    #     # self.actions[:size].copy_(data["actions"])
+    #     # self.rewards[:size].copy_(data["rewards"])
+    #     # self.dones[:size].copy_(data["dones"])
+    #     # self.time_outs[:size].copy_(data["time_outs"])
+     
+    #     # Update step counter
+    #     self.step = size
+
+    #     print(f"[FBRolloutStorage] Successfully loaded {size} transitions.")
+
+    #     return True
 
 
+    # def load_random(self, load_path):
+    #     """Load a random saved buffer file from disk into memory."""
+    #     save_dir = os.path.join(load_path, "offdata")
+
+    #     if not os.path.exists(save_dir):
+    #         print(f"[FBRolloutStorage] No offdata folder found at {save_dir}")
+    #         return False
+
+    #     # Find all buffer files
+    #     files = glob.glob(os.path.join(save_dir, "buffer_*.pt"))
+    #     if len(files) == 0:
+    #         print(f"[FBRolloutStorage] No buffer files found in {save_dir}")
+    #         return False
+
+    #     # Pick a random file
+    #     random_file = random.choice(files)
+    #     print(f"[FBRolloutStorage] Loading random buffer: {random_file}")
+
+    #     data = torch.load(random_file, weights_only=False, map_location="cpu")
+    #     size = data["size"]
+
+    #     # Check buffer size
+    #     if size > self.max_buffer_size:
+    #         raise ValueError(
+    #             f"Saved buffer size {size} exceeds current max_buffer_size {self.max_buffer_size}"
+    #         )
+
+    #     # ======================
+    #     # SAME LOGIC AS load_latest()
+    #     # ======================
+    #     # Extract shape
+    #     T, E_stored, D = data["observations"]["policy"].shape
+    #     E_target = self.num_envs
+
+    #     # Sample environment indices
+    #     env_idx = torch.randperm(E_stored)[:E_target]
+
+    #     # Slice observations
+    #     obs_dict = data["observations"]
+    #     sampled_obs = {
+    #         key: obs[:, env_idx].to(self.device)
+    #         for key, obs in obs_dict.items()
+    #     }
+
+    #     # Slice actions and other targets
+    #     sampled_actions  = data["actions"][:, env_idx].to(self.device)
+    #     sampled_rewards  = data["rewards"][:, env_idx].to(self.device)
+    #     sampled_dones    = data["dones"][:, env_idx].to(self.device)
+    #     sampled_timeouts = data["time_outs"][:, env_idx].to(self.device)
+
+    #     # Copy into replay buffer
+    #     self.observations[:T].copy_(sampled_obs)
+    #     self.actions[:T].copy_(sampled_actions)
+    #     self.rewards[:T].copy_(sampled_rewards)
+    #     self.dones[:T].copy_(sampled_dones)
+    #     self.time_outs[:T].copy_(sampled_timeouts)
+
+    #     self.step = size
+
+    #     print(f"[FBRolloutStorage] Successfully loaded {size} transitions from {random_file}")
+
+    #     return True
+
+    
+    def find_similar_obs(self,goal_states):
+        """
+        Find similar observations from storage for each environment (batch operation).
+        
+        Args:
+            goal_states: [num_envs, obs_dim] - target observations for each environment
+            
+        Returns:
+            similar_obs: [num_envs, obs_dim] - most similar observations from storage
+            distances: [num_envs] - L2 distances to the most similar observations
+        """
+        # Get storage observations: [num_timesteps, num_envs, obs_dim]
+        storage_obs = self.observations["policy"].to(goal_states.device)  # [1000, 100, 10]
+        
+        num_timesteps, num_envs, obs_dim = storage_obs.shape
+        
+        distances = torch.norm(storage_obs - goal_states.unsqueeze(0), dim=2)  # [num_timesteps, num_envs]
+        
+        # Find top 10 smallest distance indices for each environment
+        k = 10
+        top_k_distances, top_k_indices = torch.topk(distances, k, dim=0, largest=False)  # [k, num_envs]
+        
+        # Gather the top 10 most similar observations for each environment
+        # top_k_indices: [k, num_envs]
+        # storage_obs: [num_timesteps, num_envs, obs_dim]
+        env_indices = torch.arange(num_envs, device=goal_states.device).unsqueeze(0)  # [1, num_envs]
+        similar_obs = storage_obs[top_k_indices, env_indices]  # [k, num_envs, obs_dim]
+        similar_obs = similar_obs.mean(dim=0)
+        
+        return similar_obs
+    
     def get_random_idxs(self, batch_size: int):   
         n_env = len(self.dones[1])     
         idxs = torch.randint(low=0,high=self.step,size=(batch_size,n_env),dtype=torch.long)
