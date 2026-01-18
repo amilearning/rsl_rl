@@ -27,8 +27,9 @@ class FBOnPolicyRunner:
     def __init__(self, env: VecEnv, train_cfg: dict, log_dir: str | None = None, device: str = "cpu") -> None:
         self.cfg = train_cfg
         self.alg_cfg = train_cfg["algorithm"]
-        self.fb_alg_cfg = train_cfg['fb_algorithm']        
+        
         self.policy_cfg = train_cfg["policy"]
+        self.fb_alg_cfg = train_cfg['fb_algorithm']        
         self.fb_policy_cfg = train_cfg["fb_policy"]
         self.device = device
         self.env = env
@@ -87,7 +88,6 @@ class FBOnPolicyRunner:
         # Initialize writer
 
         self._prepare_logging_writer()
-        
         
         # if self.cfg["resume"]:
             # num_updates = self.fb_alg_cfg['num_agent_updates']
@@ -157,7 +157,6 @@ class FBOnPolicyRunner:
                         actions = torch.where(ppo_action_mask, ppo_actions, fb_actions)
                         
                         
-                    
                     self.fb_alg.update_transition_pre(obs, actions)
                     
                     # Step the environment

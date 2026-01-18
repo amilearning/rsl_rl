@@ -121,7 +121,7 @@ class FBRolloutStorage:
             )
 
         # Shapes: [T, E_stored, ...]
-        T, E_stored, D = data["observations"]["policy"].shape
+        T, E_stored, D = data["observations"]["hl_policy"].shape
         E_target = self.num_envs
 
         if E_target > E_stored:
@@ -363,7 +363,7 @@ class FBRolloutStorage:
             distances: [num_envs] - L2 distances to the most similar observations
         """
         # Get storage observations: [num_timesteps, num_envs, obs_dim]
-        storage_obs = self.observations["policy"].to(goal_states.device)  # [1000, 100, 10]
+        storage_obs = self.observations["hl_policy"].to(goal_states.device)  # [1000, 100, 10]
         
         num_timesteps, num_envs, obs_dim = storage_obs.shape
         
@@ -456,7 +456,7 @@ class FBRolloutStorage:
         Sample a batch of transitions with value/actor goals from the offline buffer.
         """
 
-        device = self.observations["policy"].device
+        device = self.observations["hl_policy"].device
         max_valid_idx = min(self.step, self.max_buffer_size) - 2  # -1 for next_state, another -1 for safety
         
         if max_valid_idx < 0:
@@ -518,7 +518,7 @@ class FBRolloutStorage:
         # 3) Gather data from buffers
         # -------------------------------------------------------
         env_ids = torch.arange(num_env).unsqueeze(0).expand(idxs.shape[0], num_env)  # [B, E]
-        obs_buf = self.observations["policy"]  # [N, obs_dim]
+        obs_buf = self.observations["hl_policy"]  # [N, obs_dim]
         cur_obs = obs_buf[cur_idxs,env_ids]           # [B, obs_dim]
         next_obs = obs_buf[next_idxs,env_ids]         # [B, obs_dim]
         value_goal_batch = obs_buf[value_goal_idxs,env_ids]  # [B, obs_dim]

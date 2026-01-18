@@ -163,10 +163,12 @@ class FBAlgorithm:
     def update_transition_pre(self,obs, actions):        
         self.transition.observations = obs
         self.transition.actions = actions 
-    def update_transition_post(self, rewards: torch.Tensor, dones: torch.Tensor, extras: dict[str, torch.Tensor]):        
+        
+    # def update_transition_post(self, rewards: torch.Tensor, dones: torch.Tensor, extras: dict[str, torch.Tensor]):        
+    def update_transition_post(self, rewards: torch.Tensor, dones: torch.Tensor, time_outs: torch.Tensor, ):        
         self.transition.rewards= rewards
         self.transition.dones = dones
-        self.transition.time_outs =  extras["time_outs"]
+        self.transition.time_outs =  time_outs
         self.storage.add_transitions(self.transition)
         
     def train(self, training: bool = True) -> None:
@@ -177,7 +179,7 @@ class FBAlgorithm:
 
     def get_goal_z(self, obs):        
         
-        goal_states = obs['policy'].clone()
+        goal_states = obs['hl_policy'].clone()
         goal_states[:,-4:] =  torch.randn_like(goal_states[:, -4:]) * 0.01
         # base_lin_vel
         goal_states[:,:3] =  torch.randn_like(goal_states[:, :3]) * 0.01
@@ -185,10 +187,10 @@ class FBAlgorithm:
         # goal_states[:,3] =  torch.randn_like(goal_states[:, 3]) * 0.001
         # goal_states[:,4] =  torch.randn_like(goal_states[:, 4]) * 0.001
         goal_states[:,5] =  -1.0+torch.rand_like(goal_states[:, 5]) * 0.001
-        similar_obs = self.storage.find_similar_obs(goal_states)
+        # similar_obs = self.storage.find_similar_obs(goal_states)
         
         with torch.no_grad():            
-            z = self.backward_net(similar_obs)        
+            z = self.backward_net(goal_states)        
             z = math.sqrt(self.z_dim) * F.normalize(z, dim=-1)        
               
         return z
@@ -210,15 +212,24 @@ class FBAlgorithm:
     #     return meta
     
   
-    def act(self, obs: TensorDict, is_eval= False) -> torch.Tensor:
+    def act(self, obs: torch.Tensor, is_eval= False) -> torch.Tensor:
         # Compute the actions        
 
-        goal_z = self.get_goal_z(obs)
-                    
+        if is_eval:
+            ### during training, sample z             
+            goal_z = self.get_goal_z(obs)
+        else:
+            goal_z = self.sample_z(1, obs.shape[0])
+            goal_z = goal_z.squeeze(0)
+            
+            
         # dist = self.network.select('actor')(observations, latent_z, temperature=temperature)
         # actions = dist.sample(seed=seed)
         # actions = jnp.clip(actions, -1, 1
-        obs_tensor = obs["policy"].to(self.device)
+        # obs_tensor = obs["hl_policy"].to(self.device)
+        
+        
+        obs_tensor = obs["hl_policy"].to(self.device)
         stddev = self.policy_cfg["stddev_schedule"]        
         dist = self.policy(obs_tensor, goal_z, stddev)
         

@@ -15,9 +15,9 @@ from collections import deque
 from tensordict import TensorDict
 
 import rsl_rl
-from rsl_rl.algorithms import PPO
+from rsl_rl.algorithms import PPO, FBAlgorithm
 from rsl_rl.env import VecEnv
-from rsl_rl.modules import ActorCritic
+from rsl_rl.modules import FBActor, ActorCritic, ActorCriticRecurrent, resolve_rnd_config, resolve_symmetry_config
 from rsl_rl.runners import OnPolicyRunner
 from rsl_rl.utils import resolve_obs_groups, store_code_state
 
@@ -27,16 +27,16 @@ class HierarchicalRunner(OnPolicyRunner):
 
     def __init__(self, env: VecEnv, train_cfg: dict, log_dir: str | None = None, device: str = "cpu") -> None:
         self.cfg = train_cfg
-        self.low_alg_cfg = train_cfg["low_algorithm"]        
-        self.low_policy_cfg = train_cfg["low_policy"]
-        self.high_actions_dim = train_cfg["high_policy_actions_dim"]
-        self.high_level_decimation = train_cfg["high_level_decimation"]
-        self.high_alg_cfg = train_cfg["high_algorithm"]
-        self.high_policy_cfg = train_cfg["high_policy"]
-
+        self.alg_cfg = train_cfg["algorithm"]
+        self.policy_cfg = train_cfg["policy"]
+        
+        self.fb_alg_cfg = train_cfg['fb_algorithm']        
+        self.fb_policy_cfg = train_cfg["fb_policy"]
+        
         self.device = device
         self.env = env
 
+        self.prev_data_path = None 
         # Check if multi-GPU is enabled
         self._configure_multi_gpu()
 
@@ -45,14 +45,13 @@ class HierarchicalRunner(OnPolicyRunner):
         self.save_interval = self.cfg["save_interval"]
 
         # Query observations from environment for algorithm construction
-        obs = self.env.get_observations()        
-        default_sets = ["critic"]        
+        obs = self.env.get_observations()
+        default_sets = ["critic"]
+        if "rnd_cfg" in self.alg_cfg and self.alg_cfg["rnd_cfg"] is not None:
+            default_sets.append("rnd_state")
         self.cfg["obs_groups"] = resolve_obs_groups(obs, self.cfg["obs_groups"], default_sets)
 
-
-
-        # Create the algorithm
-        self.low_alg, self.high_alg = self._construct_algorithm(obs)         
+        
 
         # Decide whether to disable logging
         # Note: We only log from the process with rank 0 (main process)
@@ -65,27 +64,84 @@ class HierarchicalRunner(OnPolicyRunner):
         self.tot_time = 0
         self.current_learning_iteration = 0
         self.git_status_repos = [rsl_rl.__file__]
+        
+        self.alg, self.fb_alg = self._construct_algorithm(obs)        
 
 
+    def _construct_algorithm(self, obs: TensorDict) -> tuple[PPO, FBAlgorithm]:
+        """Construct the actor-critic algorithm."""
+        # Resolve RND config
+        self.alg_cfg = resolve_rnd_config(self.alg_cfg, obs, self.cfg["obs_groups"], self.env)
 
-    def get_inference_policy(self, device: str | None = None) -> callable:
-        self.eval_mode()  # Switch to evaluation mode (e.g. for dropout)
-        if device is not None:
-            self.low_alg.policy.to(device)
-            self.high_alg.policy.to(device)
-        return self.low_alg.policy.act_inference
+        # Resolve symmetry config
+        self.alg_cfg = resolve_symmetry_config(self.alg_cfg, self.env)
 
+        # Resolve deprecated normalization config
+        if self.cfg.get("empirical_normalization") is not None:
+            warnings.warn(
+                "The `empirical_normalization` parameter is deprecated. Please set `actor_obs_normalization` and "
+                "`critic_obs_normalization` as part of the `policy` configuration instead.",
+                DeprecationWarning,
+            )
+            if self.policy_cfg.get("actor_obs_normalization") is None:
+                self.policy_cfg["actor_obs_normalization"] = self.cfg["empirical_normalization"]
+            if self.policy_cfg.get("critic_obs_normalization") is None:
+                self.policy_cfg["critic_obs_normalization"] = self.cfg["empirical_normalization"]
 
+        # Initialize the policy
+        actor_critic_class = eval(self.policy_cfg.pop("class_name"))
+        actor_critic: ActorCritic | ActorCriticRecurrent = actor_critic_class(
+            obs, self.cfg["obs_groups"], self.env.num_actions, **self.policy_cfg
+        ).to(self.device)
+
+        # Initialize the algorithm
+        alg_class = eval(self.alg_cfg.pop("class_name"))
+        alg: PPO = alg_class(actor_critic, device=self.device, **self.alg_cfg, multi_gpu_cfg=self.multi_gpu_cfg)
+        
+        
+        alg_class = eval(self.fb_alg_cfg.pop("class_name"))
+        
+        ''' 
+        TODO: get the hl action dim from the env command term
+        '''
+        self.hl_action_dim = self.env.env.env.env.command_manager.get_term('base_velocity').command.shape[-1]                
+        fb_alg: FBAlgorithm = alg_class(log_dir = self.log_dir, 
+                                        cfg = self.cfg,
+                                        action_dim = self.hl_action_dim,
+                                        obs_dim = obs['hl_policy'].shape[-1],                                        
+                                        device=self.device)
+
+        # Initialize the storage
+        alg.init_storage(
+            "rl",
+            self.env.num_envs,
+            self.num_steps_per_env,
+            obs,
+            [self.env.num_actions],
+        )
+
+        fb_alg.init_storage("fb",
+                            self.env.num_envs,
+                            obs,
+                            [self.hl_action_dim])
+        
+        return alg, fb_alg
+    
+    
+    
     def save(self, path: str, infos: dict | None = None) -> None:
-        # Save model
+        # Save model       
         saved_dict = {
-            "low_model_state_dict": self.low_alg.policy.state_dict(),
-            "low_optimizer_state_dict": self.low_alg.optimizer.state_dict(),
-            "high_model_state_dict": self.high_alg.policy.state_dict(),
-            "high_optimizer_state_dict": self.high_alg.optimizer.state_dict(),
+            "fb_alg_state": self.fb_alg.get_state(),
+            "model_state_dict": self.alg.policy.state_dict(),
+            "optimizer_state_dict": self.alg.optimizer.state_dict(),
             "iter": self.current_learning_iteration,
             "infos": infos,
         }
+        # Save RND model if used
+        if hasattr(self.alg, "rnd") and self.alg.rnd:
+            saved_dict["rnd_state_dict"] = self.alg.rnd.state_dict()
+            saved_dict["rnd_optimizer_state_dict"] = self.alg.rnd_optimizer.state_dict()
         torch.save(saved_dict, path)
 
         # Upload model to external logging service
@@ -95,34 +151,56 @@ class HierarchicalRunner(OnPolicyRunner):
     def load(self, path: str, load_optimizer: bool = True, map_location: str | None = None) -> dict:
         loaded_dict = torch.load(path, weights_only=False, map_location=map_location)
         # Load model
-        low_resumed_training = self.low_alg.policy.load_state_dict(loaded_dict["low_model_state_dict"])
-        high_resumed_training = self.high_alg.policy.load_state_dict(loaded_dict["high_model_state_dict"])
+        resumed_training = self.alg.policy.load_state_dict(loaded_dict["model_state_dict"])
         # Load optimizer if used
-        if load_optimizer and low_resumed_training:
+        if load_optimizer and resumed_training:
             # Algorithm optimizer
-            self.low_alg.optimizer.load_state_dict(loaded_dict["low_optimizer_state_dict"])            
-        if load_optimizer and high_resumed_training:
-            # Algorithm optimizer
-            self.high_alg.optimizer.load_state_dict(loaded_dict["high_optimizer_state_dict"])            
+            self.alg.optimizer.load_state_dict(loaded_dict["optimizer_state_dict"])            
         # Load current learning iteration
-        if low_resumed_training:
+        if resumed_training:
             self.current_learning_iteration = loaded_dict["iter"]
+            
+        if "fb_alg_state" in loaded_dict:
+            self.fb_alg.load_state(loaded_dict["fb_alg_state"], load_optim=load_optimizer)        
+        # self.fb_alg.storage.load_latest(os.path.dirname(path))
+        self.prev_data_path = path
+        
+        
         return loaded_dict["infos"]
-
-
-    def eval_mode(self) -> None:
-        # PPO
-        self.low_alg.policy.eval()
-        self.high_alg.policy.eval()
-
-    def train_mode(self) -> None:
-        # PPO
-        self.low_alg.policy.train()
-        self.high_alg.policy.train()
-
+    
+    
+    def fb_log_metrics(self, locs: dict, prefix: str = "FB") -> None:
+        """Log FB + actor metrics stored in self.metrics to a SummaryWriter-like `writer`."""
+        step = locs["it"]        
+        m = self.fb_alg.metrics
+        self.writer.add_scalar(f"{prefix}/target_M", m.get("target_M", 0.0), step)
+        self.writer.add_scalar(f"{prefix}/M1", m.get("M1", 0.0), step)
+        self.writer.add_scalar(f"{prefix}/F1", m.get("F1", 0.0), step)
+        self.writer.add_scalar(f"{prefix}/B", m.get("B", 0.0), step)
+        self.writer.add_scalar(f"{prefix}/B_norm", m.get("B_norm", 0.0), step)
+        self.writer.add_scalar(f"{prefix}/z_norm", m.get("z_norm", 0.0), step)
+        self.writer.add_scalar(f"{prefix}/fb_loss", m.get("fb_loss", 0.0), step)
+        self.writer.add_scalar(f"{prefix}/fb_diag", m.get("fb_diag", 0.0), step)
+        self.writer.add_scalar(f"{prefix}/fb_offdiag", m.get("fb_offdiag", 0.0), step)
+        self.writer.add_scalar(f"{prefix}/orth_loss", m.get("orth_loss", 0.0), step)
+        self.writer.add_scalar(f"{prefix}/orth_loss_diag", m.get("orth_loss_diag", 0.0), step)
+        self.writer.add_scalar(f"{prefix}/orth_loss_offdiag", m.get("orth_loss_offdiag", 0.0), step)        
+        self.writer.add_scalar(f"{prefix}/actor_loss", m.get("actor_loss", 0.0), step)
+        self.writer.add_scalar(f"{prefix}/q", m.get("q", 0.0), step)
+        self.writer.add_scalar(f"{prefix}/actor_logprob", m.get("actor_logprob", 0.0), step)
+        
+   
+    def train_fb(self):
+        num_updates = self.fb_alg_cfg['num_agent_updates']
+        for train_it in range(num_updates):
+            # 1. Run one FB update
+            self.fb_alg.update()
+            
+            
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False) -> None:
         # Initialize writer
         self._prepare_logging_writer()
+
         # Randomize initial episode lengths (for exploration)
         if init_at_random_ep_len:
             self.env.episode_length_buf = torch.randint_like(
@@ -140,6 +218,13 @@ class HierarchicalRunner(OnPolicyRunner):
         cur_reward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
         cur_episode_length = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
 
+        # Create buffers for logging extrinsic and intrinsic rewards
+        if self.alg.rnd:
+            erewbuffer = deque(maxlen=100)
+            irewbuffer = deque(maxlen=100)
+            cur_ereward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
+            cur_ireward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
+
         # Ensure all parameters are in-synced
         if self.is_distributed:
             print(f"Synchronizing parameters for rank {self.gpu_global_rank}...")
@@ -148,42 +233,61 @@ class HierarchicalRunner(OnPolicyRunner):
         # Start training
         start_iter = self.current_learning_iteration
         tot_iter = start_iter + num_learning_iterations
+        
+        hl_action_command = self.env.env.env.env.command_manager.get_term('base_velocity').command.clone()
+        
         for it in range(start_iter, tot_iter):
             start = time.time()
             # Rollout
             with torch.inference_mode():
-                
-                mdp_count_for_hl = torch.zeros(self.env.num_envs, dtype=torch.int32, device=self.device)
-                sample_high_level = torch.ones(self.env.num_envs, dtype=torch.bool, device=self.device)
-                hl_actions = self.high_alg.act(obs).clone()                                     
+                for itt in range(self.num_steps_per_env):                    
+                    '''
+                    high level policy interaction
+                    '''          
+                    if itt % self.cfg["hl_policy_decimation_multiplier"] == 0:                    
+                        '''
+                        TODO : get the hl action command from the env command term
+                        '''
+                        hl_obs =  obs.clone()                        
+                        hl_action_command = self.env.env.env.env.command_manager.get_term('base_velocity').command.clone()
+                        self.fb_alg.update_transition_pre(hl_obs, hl_action_command)                    
+                    # if itt % self.cfg["hl_policy_decimation_multiplier"] == 0 and itt > 1:                                                                                            
+                    #     hl_actions = self.fb_alg.act(hl_obs, is_eval = False)
+                    #     if it > self.fb_alg_cfg["num_prior_data_collect_epoch"]+1:                            
+                    #         self.fb_alg.update_transition_pre(hl_obs, hl_actions)                            
+                    '''
+                    remap the hl action command to the obs for ll policy
+                    '''
+                    obs['policy'][:,-self.hl_action_dim:] = hl_action_command                                        
 
-                for env_count in range(self.num_steps_per_env):                    
-                    high_actions_ = self.high_alg.act(obs)                                                                                
-                    hl_actions[sample_high_level,:] = high_actions_[sample_high_level,:].clone()                    
-                    
-                    obs['policy'][sample_high_level,-self.high_actions_dim:] = hl_actions[sample_high_level,:].clone()
-                    self.env.env.env.env.command_manager._terms['base_velocity'].vel_command_b[sample_high_level,:] = high_actions_[sample_high_level,:].clone()
-                    
-                    low_actions = self.low_alg.act(obs)                    
-                    mdp_count_for_hl+=1
+                    '''
+                    low level policy interaction
+                    '''                    
+                    # Sample ll_actions
+                    ll_actions = self.alg.act(obs)
                     # Step the environment
-                    obs, low_rewards, high_rewards, dones, extras = self.env.step(low_actions.to(self.env.device))
+                    obs, rewards, dones, extras = self.env.step(ll_actions.to(self.env.device))
                     # Move to device
-                    obs, low_rewards, high_rewards, dones = (obs.to(self.device), low_rewards.to(self.device), high_rewards.to(self.device), dones.to(self.device))
+                    obs, rewards, dones = (obs.to(self.device), rewards.to(self.device), dones.to(self.device))
                     # Process the step
-                    self.low_alg.process_env_step(obs, low_rewards, dones, extras)
- 
-                    ## check if we need to resample high level actions , if so, change the sample_high_level[env] as True                                   
-                    sample_high_level[:] = False  
-                    decimation_reached_mask = mdp_count_for_hl >= self.high_level_decimation
-                    reset_mdp_count_for_hl_mask = dones | decimation_reached_mask
-                    sample_high_level[reset_mdp_count_for_hl_mask] = True
-                    mdp_count_for_hl[reset_mdp_count_for_hl_mask] = 0
-                        
-                    if len(obs[sample_high_level]) > 0:
-                        self.high_alg.process_env_step(obs[sample_high_level], high_rewards[sample_high_level], dones[sample_high_level], extras[sample_high_level])
-                    # Extract intrinsic rewards (only for logging)
+                    self.alg.process_env_step(obs, rewards, dones, extras)
                     
+                    if itt % self.cfg["hl_policy_decimation_multiplier"] == 0:    
+                        hl_dones = dones.clone()                            
+                        hl_time_outs = extras['time_outs'].clone()
+                    else:
+                        hl_dones = hl_dones | dones
+                        hl_time_outs = hl_time_outs | extras['time_outs']
+                    
+                    if itt % self.cfg["hl_policy_decimation_multiplier"] == 0:    
+                        '''
+                        TODO: compute hl_rewards if can 
+                        '''
+                        hl_rewards = rewards.clone()                                                
+                        self.fb_alg.update_transition_post(hl_rewards, hl_dones, hl_time_outs)
+                                                 
+                    # Extract intrinsic rewards (only for logging)
+                    intrinsic_rewards = self.alg.intrinsic_rewards if self.alg.rnd else None
                     # Book keeping
                     if self.log_dir is not None:
                         if "episode" in extras:
@@ -191,8 +295,12 @@ class HierarchicalRunner(OnPolicyRunner):
                         elif "log" in extras:
                             ep_infos.append(extras["log"])
                         # Update rewards
-                    
-                        cur_reward_sum +=  low_rewards
+                        if self.alg.rnd:
+                            cur_ereward_sum += rewards
+                            cur_ireward_sum += intrinsic_rewards
+                            cur_reward_sum += rewards + intrinsic_rewards
+                        else:
+                            cur_reward_sum += rewards
                         # Update episode length
                         cur_episode_length += 1
                         # Clear data for completed episodes
@@ -201,27 +309,38 @@ class HierarchicalRunner(OnPolicyRunner):
                         lenbuffer.extend(cur_episode_length[new_ids][:, 0].cpu().numpy().tolist())
                         cur_reward_sum[new_ids] = 0
                         cur_episode_length[new_ids] = 0
-                  
+                        if self.alg.rnd:
+                            erewbuffer.extend(cur_ereward_sum[new_ids][:, 0].cpu().numpy().tolist())
+                            irewbuffer.extend(cur_ireward_sum[new_ids][:, 0].cpu().numpy().tolist())
+                            cur_ereward_sum[new_ids] = 0
+                            cur_ireward_sum[new_ids] = 0
 
                 stop = time.time()
                 collection_time = stop - start
                 start = stop
 
                 # Compute returns
-                self.low_alg.compute_returns(obs)
-                self.high_alg.compute_returns(obs)
+                self.alg.compute_returns(obs)
 
             # Update policy
-            loss_dict = self.low_alg.update()
-            loss_dict = self.high_alg.update()
+            loss_dict = self.alg.update()
 
             stop = time.time()
             learn_time = stop - start
             self.current_learning_iteration = it
 
+            fb_start = time.time()
+            if self.cfg["resume"] or it > self.fb_alg_cfg["num_prior_data_collect_epoch"]: #                                              
+                self.train_fb()
+            fb_stop = time.time()            
+            train_fb_time = fb_stop - fb_start
+            
+            
             if self.log_dir is not None and not self.disable_logs:
                 # Log information
-                self.log(locals())
+                self.log(locals())                
+                self.fb_log_metrics(locals())
+                
                 # Save model
                 if it % self.save_interval == 0:
                     self.save(os.path.join(self.log_dir, f"model_{it}.pt"))
@@ -241,178 +360,32 @@ class HierarchicalRunner(OnPolicyRunner):
         if self.log_dir is not None and not self.disable_logs:
             self.save(os.path.join(self.log_dir, f"model_{self.current_learning_iteration}.pt"))
 
-    def _construct_algorithm(self, obs: TensorDict) -> PPO:
-        """Construct the actor-critic algorithm."""
+
+
+    def train_fb(self):
+        num_updates = self.fb_alg_cfg['num_agent_updates']
+        for train_it in range(num_updates):
+            # 1. Run one FB update
+            self.fb_alg.update()
+            
+            
+    def fb_log_metrics(self, locs: dict, prefix: str = "FB") -> None:
+        """Log FB + actor metrics stored in self.metrics to a SummaryWriter-like `writer`."""
+        step = locs["it"]        
+        m = self.fb_alg.metrics
+        self.writer.add_scalar(f"{prefix}/target_M", m.get("target_M", 0.0), step)
+        self.writer.add_scalar(f"{prefix}/M1", m.get("M1", 0.0), step)
+        self.writer.add_scalar(f"{prefix}/F1", m.get("F1", 0.0), step)
+        self.writer.add_scalar(f"{prefix}/B", m.get("B", 0.0), step)
+        self.writer.add_scalar(f"{prefix}/B_norm", m.get("B_norm", 0.0), step)
+        self.writer.add_scalar(f"{prefix}/z_norm", m.get("z_norm", 0.0), step)
+        self.writer.add_scalar(f"{prefix}/fb_loss", m.get("fb_loss", 0.0), step)
+        self.writer.add_scalar(f"{prefix}/fb_diag", m.get("fb_diag", 0.0), step)
+        self.writer.add_scalar(f"{prefix}/fb_offdiag", m.get("fb_offdiag", 0.0), step)
+        self.writer.add_scalar(f"{prefix}/orth_loss", m.get("orth_loss", 0.0), step)
+        self.writer.add_scalar(f"{prefix}/orth_loss_diag", m.get("orth_loss_diag", 0.0), step)
+        self.writer.add_scalar(f"{prefix}/orth_loss_offdiag", m.get("orth_loss_offdiag", 0.0), step)        
+        self.writer.add_scalar(f"{prefix}/actor_loss", m.get("actor_loss", 0.0), step)
+        self.writer.add_scalar(f"{prefix}/q", m.get("q", 0.0), step)
+        self.writer.add_scalar(f"{prefix}/actor_logprob", m.get("actor_logprob", 0.0), step)
         
-        # Resolve deprecated normalization config
-        if self.cfg.get("empirical_normalization") is not None:
-            warnings.warn(
-                "The `empirical_normalization` parameter is deprecated. Please set `actor_obs_normalization` and "
-                "`critic_obs_normalization` as part of the `policy` configuration instead.",
-                DeprecationWarning,
-            )
-            if self.low_policy_cfg.get("actor_obs_normalization") is None:
-                self.low_policy_cfg["actor_obs_normalization"] = self.cfg["empirical_normalization"]
-            if self.low_policy_cfg.get("critic_obs_normalization") is None:
-                self.low_policy_cfg["critic_obs_normalization"] = self.cfg["empirical_normalization"]
-            if self.high_policy_cfg.get("actor_obs_normalization") is None:
-                self.high_policy_cfg["actor_obs_normalization"] = self.cfg["empirical_normalization"]
-            if self.high_policy_cfg.get("critic_obs_normalization") is None:
-                self.high_policy_cfg["critic_obs_normalization"] = self.cfg["empirical_normalization"]
-
-        '''
-        Iniitalize Low level policy 
-        '''
-        # Initialize the policy
-        low_actor_critic_class = eval(self.low_policy_cfg.pop("class_name"))
-        low_actor_critic: ActorCritic = low_actor_critic_class(
-            obs, self.cfg["obs_groups"], self.env.num_actions, **self.low_policy_cfg
-        ).to(self.device)
-
-        # Initialize the algorithm
-        low_alg_class = eval(self.low_alg_cfg.pop("class_name"))
-        low_alg: PPO = low_alg_class(low_actor_critic, device=self.device, **self.low_alg_cfg, multi_gpu_cfg=self.multi_gpu_cfg)
-
-        # Initialize the storage
-        low_alg.init_storage(
-            "rl",
-            self.env.num_envs,
-            self.num_steps_per_env,
-            obs,
-            [self.env.num_actions],
-        )
-
-        '''
-        Iniitalize High level policy 
-        '''
-        # Initialize the policy
-        high_actor_critic_class = eval(self.high_policy_cfg.pop("class_name"))
-        high_actor_critic: ActorCritic = high_actor_critic_class(
-            obs, self.cfg["obs_groups"], self.high_actions_dim, **self.high_policy_cfg
-        ).to(self.device)
-
-        # Initialize the algorithm
-        high_alg_class = eval(self.high_alg_cfg.pop("class_name"))
-        high_alg: PPO = high_alg_class(high_actor_critic, device=self.device, **self.high_alg_cfg, multi_gpu_cfg=self.multi_gpu_cfg)
-
-        # Initialize the storage
-        high_alg.init_storage(
-            "rl",
-            self.env.num_envs,
-            self.num_steps_per_env,
-            obs,
-            [self.high_actions_dim],
-        )
-
-        return low_alg, high_alg
-    
-    def log(self, locs: dict, width: int = 80, pad: int = 35) -> None:
-        # Compute the collection size
-        collection_size = self.num_steps_per_env * self.env.num_envs * self.gpu_world_size
-        # Update total time-steps and time
-        self.tot_timesteps += collection_size
-        self.tot_time += locs["collection_time"] + locs["learn_time"]
-        iteration_time = locs["collection_time"] + locs["learn_time"]
-        # Log episode information
-        ep_string = ""
-        if locs["ep_infos"]:
-            for key in locs["ep_infos"][0]:
-                infotensor = torch.tensor([], device=self.device)
-                for ep_info in locs["ep_infos"]:
-                    # Handle scalar and zero dimensional tensor infos
-                    if key not in ep_info:
-                        continue
-                    if not isinstance(ep_info[key], torch.Tensor):
-                        ep_info[key] = torch.Tensor([ep_info[key]])
-                    if len(ep_info[key].shape) == 0:
-                        ep_info[key] = ep_info[key].unsqueeze(0)
-                    infotensor = torch.cat((infotensor, ep_info[key].to(self.device)))
-                value = torch.mean(infotensor)
-                # Log to logger and terminal
-                if "/" in key:
-                    self.writer.add_scalar(key, value, locs["it"])
-                    ep_string += f"""{f"{key}:":>{pad}} {value:.4f}\n"""
-                else:
-                    self.writer.add_scalar("Episode/" + key, value, locs["it"])
-                    ep_string += f"""{f"Mean episode {key}:":>{pad}} {value:.4f}\n"""
-
-        low_mean_std = self.low_alg.policy.action_std.mean()
-        high_mean_std = self.high_alg.policy.action_std.mean()
-        fps = int(collection_size / (locs["collection_time"] + locs["learn_time"]))
-
-        # Log losses
-        for key, value in locs["loss_dict"].items():
-            self.writer.add_scalar(f"Loss/{key}", value, locs["it"])
-        self.writer.add_scalar("Loss/low_learning_rate", self.low_alg.learning_rate, locs["it"])
-        self.writer.add_scalar("Loss/high_learning_rate", self.high_alg.learning_rate, locs["it"])
-
-        # Log noise std
-        self.writer.add_scalar("Policy/low_mean_noise_std", low_mean_std.item(), locs["it"])
-        self.writer.add_scalar("Policy/high_mean_noise_std", high_mean_std.item(), locs["it"])
-
-        # Log performance
-        self.writer.add_scalar("Perf/total_fps", fps, locs["it"])
-        self.writer.add_scalar("Perf/collection time", locs["collection_time"], locs["it"])
-        self.writer.add_scalar("Perf/learning_time", locs["learn_time"], locs["it"])
-
-        # Log training
-        # if len(locs["rewbuffer"]) > 0:
-        #     # Separate logging for intrinsic and extrinsic rewards        
-        #     # Everything else
-        #     self.writer.add_scalar("Train/mean_reward", statistics.mean(locs["rewbuffer"]), locs["it"])
-        #     self.writer.add_scalar("Train/mean_episode_length", statistics.mean(locs["lenbuffer"]), locs["it"])
-        #     if self.logger_type != "wandb":  # wandb does not support non-integer x-axis logging
-        #         self.writer.add_scalar("Train/mean_reward/time", statistics.mean(locs["rewbuffer"]), self.tot_time)
-        #         self.writer.add_scalar(
-        #             "Train/mean_episode_length/time", statistics.mean(locs["lenbuffer"]), self.tot_time
-        #         )
-
-        str = f" \033[1m Learning iteration {locs['it']}/{locs['tot_iter']} \033[0m "
-
-        if len(locs["rewbuffer"]) > 0:
-            log_string = (
-                f"""{"#" * width}\n"""
-                # f"""{str.center(width, " ")}\n\n"""
-                f"""{"Computation:":>{pad}} {fps:.0f} steps/s (collection: {locs["collection_time"]:.3f}s, learning {
-                    locs["learn_time"]:.3f}s)\n"""
-                f"""{"Low Mean action noise std:":>{pad}} {low_mean_std.item():.2f}\n"""
-                f"""{"High Mean action noise std:":>{pad}} {high_mean_std.item():.2f}\n"""
-            )
-            # Print losses
-            for key, value in locs["loss_dict"].items():
-                log_string += f"""{f"Mean {key} loss:":>{pad}} {value:.4f}\n"""
-            # Print rewards
-
-            # log_string += f"""{"Mean reward:":>{pad}} {statistics.mean(locs["rewbuffer"]):.2f}\n"""
-            # # Print episode information
-            # log_string += f"""{"Mean episode length:":>{pad}} {statistics.mean(locs["lenbuffer"]):.2f}\n"""
-        else:
-            log_string = (
-                f"""{"#" * width}\n"""
-                f"""{str.center(width, " ")}\n\n"""
-                f"""{"Computation:":>{pad}} {fps:.0f} steps/s (collection: {locs["collection_time"]:.3f}s, learning {
-                    locs["learn_time"]:.3f}s)\n"""
-                f"""{"Low Mean action noise std:":>{pad}} {low_mean_std.item():.2f}\n"""
-                f"""{"High Mean action noise std:":>{pad}} {high_mean_std.item():.2f}\n"""
-            )
-            for key, value in locs["loss_dict"].items():
-                log_string += f"""{f"{key}:":>{pad}} {value:.4f}\n"""
-
-        log_string += ep_string
-        log_string += (
-            f"""{"-" * width}\n"""
-            f"""{"Total timesteps:":>{pad}} {self.tot_timesteps}\n"""
-            f"""{"Iteration time:":>{pad}} {iteration_time:.2f}s\n"""
-            f"""{"Time elapsed:":>{pad}} {time.strftime("%H:%M:%S", time.gmtime(self.tot_time))}\n"""
-            f"""{"ETA:":>{pad}} {
-                time.strftime(
-                    "%H:%M:%S",
-                    time.gmtime(
-                        self.tot_time
-                        / (locs["it"] - locs["start_iter"] + 1)
-                        * (locs["start_iter"] + locs["num_learning_iterations"] - locs["it"])
-                    ),
-                )
-            }\n"""
-        )
-        print(log_string)
