@@ -122,7 +122,7 @@ class HierarchicalRunner(OnPolicyRunner):
         alg.init_storage(
             "rl",
             self.env.num_envs,
-            self.num_steps_per_env,
+            int(self.num_steps_per_env/self.cfg["hl_policy_decimation_multiplier"]),
             obs,
             [self.hl_action_dim],
         )
@@ -296,7 +296,17 @@ class HierarchicalRunner(OnPolicyRunner):
         hlg_actions = hl_actions.clone()
         iter_count = 0
         
+        
+        '''
+        require for High level done and timeout computation.
+        '''
+        acc_done = torch.zeros(self.env.num_envs, dtype=torch.bool, device=self.device)
+        acc_timeout = torch.zeros(self.env.num_envs, dtype=torch.bool, device=self.device)
+        acc_obs = obs.copy()
+        acc_rewards = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
+        
         for it in range(start_iter, tot_iter):
+            
             iter_count += 1
             start = time.time()
             # Rollout
@@ -308,70 +318,89 @@ class HierarchicalRunner(OnPolicyRunner):
                     # TODO # TODO # TODO # TODO # TODO # TODO # TODO # TODO # TODO # TODO # TODO # TODO 
                     '''
                     high level policy interaction
-                    '''          
-                    if itt % self.cfg["hl_policy_decimation_multiplier"] == 0:                    
-                        '''
-                        TODO : get the hl action command from the env command term
-                        '''
-                        hl_obs =  obs.clone()                                                
-                        current_hl_command = self.base_env.command_manager.get_term('base_velocity').command.clone()                        
-                        if self.cfg["train_hl_policy"]: 
-                            hl_actions = current_hl_command                            
-                            explore_hl_actions = self.fb_alg.act(hl_obs, is_eval=False)     
-                            eval_hl_actions = None
-                            num_envs = hl_actions.shape[0]                            
-                            # Define ratios as fractions (ensure they sum to 1.0 for full coverage)
-                            if iter_count < self.fb_alg_cfg["num_prior_data_collect_epoch"]:
-                                cmd_ratio = 0.8
-                                explore_ratio = 0.2                                
-                            else:                      
-                                cmd_explore_ratio = max(0.5, 0.8 - 0.6 * (iter_count - self.fb_alg_cfg["num_prior_data_collect_epoch"]) / 50)          
-                                cmd_ratio = cmd_explore_ratio/2.0
-                                explore_ratio = cmd_explore_ratio/2.0 # min(0.4, 0.2 + 0.2 * (iter_count - self.fb_alg_cfg["num_prior_data_collect_epoch"]) / 50)                                
-                                eval_ratio = 1.0 - cmd_ratio - explore_ratio
+                    ''' 
+                    hl_obs =  obs.clone()                                                
+                    hl_actions = self.base_env.command_manager.get_term('base_velocity').command.clone()                                                                         
+                    # if self.cfg["train_hl_policy"]: 
+                    #     if itt % self.cfg["hl_policy_decimation_multiplier"] == 0:                    
+                    #         '''
+                    #         TODO : get the hl action command from the env command term
+                    #         '''                            
+                    #         explore_hl_actions = self.fb_alg.act(hl_obs, is_eval=False)     
+                    #         eval_hl_actions = None
+                    #         num_envs = hl_actions.shape[0]                            
+                    #         # Define ratios as fractions (ensure they sum to 1.0 for full coverage)
+                    #         if iter_count < self.fb_alg_cfg["num_prior_data_collect_epoch"]:
+                    #             cmd_ratio = 0.8
+                    #             explore_ratio = 0.2                                
+                    #         else:                      
+                    #             cmd_explore_ratio = max(0.5, 0.8 - 0.6 * (iter_count - self.fb_alg_cfg["num_prior_data_collect_epoch"]) / 50)          
+                    #             cmd_ratio = cmd_explore_ratio/2.0
+                    #             explore_ratio = cmd_explore_ratio/2.0 # min(0.4, 0.2 + 0.2 * (iter_count - self.fb_alg_cfg["num_prior_data_collect_epoch"]) / 50)                                
+                    #             eval_ratio = 1.0 - cmd_ratio - explore_ratio
                                 
-                                eval_hl_actions = self.fb_alg.act(hl_obs, is_eval=True)
-                                # cmd_ratio = 0.0
-                                # explore_ratio = 0.0                                
+                    #             eval_hl_actions = self.fb_alg.act(hl_obs, is_eval=True)
+                    #             # cmd_ratio = 0.0
+                    #             # explore_ratio = 0.0                                
                             
-                            cmd_count = int(num_envs * cmd_ratio)
-                            explore_count = int(num_envs * explore_ratio)                            
+                    #         cmd_count = int(num_envs * cmd_ratio)
+                    #         explore_count = int(num_envs * explore_ratio)                            
                             
-                            # Permute indices and split into segments
-                            permuted_indices = torch.randperm(num_envs)
-                            cmd_idx = permuted_indices[:cmd_count]
-                            explore_idx = permuted_indices[cmd_count:cmd_count + explore_count]
-                            eval_idx = permuted_indices[cmd_count + explore_count:]
+                    #         # Permute indices and split into segments
+                    #         permuted_indices = torch.randperm(num_envs)
+                    #         cmd_idx = permuted_indices[:cmd_count]
+                    #         explore_idx = permuted_indices[cmd_count:cmd_count + explore_count]
+                    #         eval_idx = permuted_indices[cmd_count + explore_count:]
                             
-                            # Assign actions to respective subsets
-                            hl_actions[cmd_idx,:] = current_hl_command[cmd_idx,:]
-                            hl_actions[explore_idx,:] = explore_hl_actions[explore_idx,:]
-                            if eval_hl_actions is not None:
-                                # hl_actions[eval_idx,:] = eval_hl_actions[eval_idx,:]
-                                #TODO: temp fix
-                                hl_actions = eval_hl_actions
+                    #         # Assign actions to respective subsets                            
+                    #         hl_actions[explore_idx,:] = explore_hl_actions[explore_idx,:]
+                    #         if eval_hl_actions is not None:
+                    #             # hl_actions[eval_idx,:] = eval_hl_actions[eval_idx,:]
+                    #             #TODO: temp fix
+                    #             hl_actions = eval_hl_actions
 
-                        self.fb_alg.update_transition_pre(hl_obs, hl_actions)                    
+                    #     self.fb_alg.update_transition_pre(hl_obs, hl_actions)                    
                     # if itt % self.cfg["hl_policy_decimation_multiplier"] == 0 and itt > 1:                                                                                            
                     #     hl_actions = self.fb_alg.act(hl_obs, is_eval = False)
                     #     if it > self.fb_alg_cfg["num_prior_data_collect_epoch"]+1:                            
                     #         self.fb_alg.update_transition_pre(hl_obs, hl_actions)                            
-                    '''
-                    remap the hl action command to the obs for ll policy
-                    '''
-                    
+                   
                     # obs['policy'][:,-self.hl_action_dim:] = hl_actions.clone()                                       
-                    if itt % self.cfg["hl_policy_decimation_multiplier"] == 0:                    
-                        if self.cfg["train_hlg_policy"]:
+                    if itt % self.cfg["hl_policy_decimation_multiplier"] == 0:                                            
+                        if self.cfg["train_hlg_policy"]:                            
                             hlg_actions = self.hlg_alg.act(hl_obs)                    
                             hl_actions = hlg_actions
+                                                        
+                        if self.cfg["train_hl_policy"]:
+                            if self.fb_alg.storage.step >0:
+                                explore_hl_actions = self.fb_alg.act(hl_obs, is_eval=False)  
+                                eval_hl_actions = self.fb_alg.act(hl_obs, is_eval=True)
+                                
+                                permuted_indices = torch.randperm(explore_hl_actions.shape[0])
+                                
+                                if 21 <= iter_count <= 100:
+                                    explore_cmd_ratio = (iter_count - 20) / (100 - 20)*0.3
+                                    explore_idx = int(explore_cmd_ratio*explore_hl_actions.shape[0])
+                                    eval_cmd_ratio = (iter_count - 20) / (100 - 20)*0.3
+                                    eval_idx = int(eval_cmd_ratio*explore_hl_actions.shape[0])
+                                    permuted_indices[:explore_idx]
+                                    # deterministic mask (first k dims → eval, rest → explore)
+                                    hl_actions[permuted_indices[:explore_idx],:] = explore_hl_actions[permuted_indices[:explore_idx],:].clone()
+                                    hl_actions[ permuted_indices[explore_idx:explore_idx+eval_idx],:] = eval_hl_actions[ permuted_indices[explore_idx:explore_idx+eval_idx],:].clone()                                
+                                elif iter_count > 100:
+                                    # phase 3: eval only
+                                    hl_actions = eval_hl_actions
+
+                            
+                            self.fb_alg.update_transition_pre(hl_obs, hl_actions)                    
+                    
+                    obs['policy'][:,-self.hl_action_dim:] = hl_actions.clone()                         
+                    self.base_env.command_manager.get_term('base_velocity').vel_command_b = hl_actions.clone()                    
 
                     # TODO # TODO # TODO # TODO # TODO # TODO # TODO # TODO # TODO # TODO # TODO # TODO 
                     # TODO # TODO # TODO # TODO # TODO # TODO # TODO # TODO # TODO # TODO # TODO # TODO 
                     # TODO # TODO # TODO # TODO # TODO # TODO # TODO # TODO # TODO # TODO # TODO # TODO                  
                                         
-                    obs['policy'][:,-self.hl_action_dim:] = hl_actions.clone()                         
-                    self.base_env.command_manager.get_term('base_velocity').vel_command_b = hl_actions.clone()                    
 
 
                     '''
@@ -387,21 +416,6 @@ class HierarchicalRunner(OnPolicyRunner):
                     # Process the step
                     self.alg.process_env_step(obs, rewards, dones, extras)
                     
-                    if itt % self.cfg["hl_policy_decimation_multiplier"] == 0:    
-                        self.hlg_alg.process_env_step(obs, hl_rewards, dones, extras)
-                    
-                    if itt % self.cfg["hl_policy_decimation_multiplier"] == 0:    
-                        hl_dones = dones.clone()                            
-                        hl_time_outs = extras['time_outs'].clone()
-                    else:
-                        hl_dones = hl_dones | dones
-                        hl_time_outs = hl_time_outs | extras['time_outs']
-                    
-                    if itt % self.cfg["hl_policy_decimation_multiplier"] == 0:                                                    
-                        hl_rewards = hl_rewards.to(self.device)                                         
-                        self.fb_alg.update_transition_post(hl_rewards, hl_dones, hl_time_outs)
-                                                 
-                    
                     # Book keeping
                     if self.log_dir is not None:
                         if "episode" in extras:
@@ -409,18 +423,61 @@ class HierarchicalRunner(OnPolicyRunner):
                         elif "log" in extras:
                             ep_infos.append(extras["log"])
                         # Update rewards                     
-                        cur_reward_sum += rewards                        
-                        cur_hl_reward_sum += hl_rewards
+                        cur_reward_sum += rewards   
                         # Update episode length
                         cur_episode_length += 1
                         # Clear data for completed episodes
                         new_ids = (dones > 0).nonzero(as_tuple=False)
-                        rewbuffer.extend(cur_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
-                        hl_rewbuffer.extend(cur_hl_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
+                        rewbuffer.extend(cur_reward_sum[new_ids][:, 0].cpu().numpy().tolist())                        
                         lenbuffer.extend(cur_episode_length[new_ids][:, 0].cpu().numpy().tolist())
                         cur_reward_sum[new_ids] = 0                        
                         cur_hl_reward_sum[new_ids] = 0
-                        cur_episode_length[new_ids] = 0                        
+                        cur_episode_length[new_ids] = 0  
+
+
+                                   
+
+                    # inside LL loop:
+                    dones_b = dones.bool()
+                    tout_b = extras["time_outs"].bool()
+
+                    acc_done |= dones_b
+                    acc_timeout |= tout_b
+                    acc_idx = acc_done | acc_timeout  # envs that have terminated/timeout-ed at least once in this window
+
+                    acc_obs[~acc_idx] = obs[~acc_idx]
+                    acc_obs[acc_idx] = acc_obs[acc_idx]
+                    
+                    acc_rewards[~acc_idx] = hl_rewards[~acc_idx]
+                    acc_rewards[acc_idx] = acc_rewards[acc_idx]
+                    
+                    if itt % self.cfg["hl_policy_decimation_multiplier"] == 0:                            
+                        hl_rewards= acc_rewards.clone()
+                        hl_obs = acc_obs.clone()
+                        hl_extras = extras.copy()                        
+                        hl_extras["time_outs"] = acc_timeout.clone()
+                        hl_dones = acc_done.clone()
+                        hl_time_outs = acc_timeout.clone()
+                        # reset window
+                        acc_done.zero_()
+                        acc_timeout.zero_()
+                        acc_obs = hl_obs.clone()
+                        acc_rewards = hl_rewards.clone()
+                      
+                        if self.log_dir is not None:
+                            cur_hl_reward_sum += hl_rewards
+                            hl_rewbuffer.extend(cur_hl_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
+                            
+                        
+                   
+                        if self.cfg["train_hl_policy"]:                            
+                            hl_rewards = hl_rewards.to(self.device)                                         
+                            self.fb_alg.update_transition_post(hl_rewards, hl_dones, hl_time_outs)
+                                
+                        if self.cfg["train_hlg_policy"]:
+                            self.hlg_alg.process_env_step(hl_obs, hl_rewards, hl_dones, hl_extras)
+                        
+                                          
 
                 stop = time.time()
                 collection_time = stop - start
@@ -457,6 +514,8 @@ class HierarchicalRunner(OnPolicyRunner):
                 # Log information
                 if self.cfg['train_ll_policy']:
                     self.log(locals())  
+                if self.cfg["train_hlg_policy"]:
+                    self.hl_log_metrics(locals())
                 if self.cfg['train_hl_policy']:                       
                     self.fb_log_metrics(locals())
                 
@@ -489,12 +548,14 @@ class HierarchicalRunner(OnPolicyRunner):
             self.fb_alg.update()
             
             
+    def hl_log_metrics(self, locs: dict, prefix: str = "HL") -> None:        
+        if len(locs["hl_rewbuffer"]) > 0:
+            self.writer.add_scalar("Train/hl_mean_reward", statistics.mean(locs["hl_rewbuffer"]), locs["it"])
+            
     def fb_log_metrics(self, locs: dict, prefix: str = "FB") -> None:
         """Log FB + actor metrics stored in self.metrics to a SummaryWriter-like `writer`."""
         
         step = locs["it"]        
-        if len(locs["hl_rewbuffer"]) > 0:
-            self.writer.add_scalar("Train/hl_mean_reward", statistics.mean(locs["hl_rewbuffer"]), locs["it"])
         m = self.fb_alg.metrics
         self.writer.add_scalar(f"{prefix}/target_M", m.get("target_M", 0.0), step)
         self.writer.add_scalar(f"{prefix}/M1", m.get("M1", 0.0), step)
