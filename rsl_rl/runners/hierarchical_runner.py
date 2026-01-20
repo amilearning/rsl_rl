@@ -375,10 +375,11 @@ class HierarchicalRunner(OnPolicyRunner):
                             if self.fb_alg.storage.step >0:
                                 explore_hl_actions = self.fb_alg.act(hl_obs, is_eval=False)  
                                 eval_hl_actions = self.fb_alg.act(hl_obs, is_eval=True)
-                                
                                 permuted_indices = torch.randperm(explore_hl_actions.shape[0])
                                 
-                                if 21 <= iter_count <= 100:
+                                if  iter_count < 50:
+                                    hl_actions = hlg_actions
+                                elif 50 <= iter_count <= 100:
                                     explore_cmd_ratio = (iter_count - 20) / (100 - 20)*0.3
                                     explore_idx = int(explore_cmd_ratio*explore_hl_actions.shape[0])
                                     eval_cmd_ratio = (iter_count - 20) / (100 - 20)*0.3
@@ -387,9 +388,18 @@ class HierarchicalRunner(OnPolicyRunner):
                                     # deterministic mask (first k dims → eval, rest → explore)
                                     hl_actions[permuted_indices[:explore_idx],:] = explore_hl_actions[permuted_indices[:explore_idx],:].clone()
                                     hl_actions[ permuted_indices[explore_idx:explore_idx+eval_idx],:] = eval_hl_actions[ permuted_indices[explore_idx:explore_idx+eval_idx],:].clone()                                
-                                elif iter_count > 100:
-                                    # phase 3: eval only
-                                    hl_actions = eval_hl_actions
+                                elif 100 < iter_count < 150:
+                                    explore_cmd_ratio = (iter_count - 20) / (100 - 20)*0.5
+                                    explore_idx = int(explore_cmd_ratio*explore_hl_actions.shape[0])
+                                    eval_cmd_ratio = (iter_count - 20) / (100 - 20)*0.5
+                                    eval_idx = int(eval_cmd_ratio*explore_hl_actions.shape[0])
+                                    permuted_indices[:explore_idx]
+                                    # deterministic mask (first k dims → eval, rest → explore)
+                                    hl_actions[permuted_indices[:explore_idx],:] = explore_hl_actions[permuted_indices[:explore_idx],:].clone()
+                                    hl_actions[ permuted_indices[explore_idx:explore_idx+eval_idx],:] = eval_hl_actions[ permuted_indices[explore_idx:explore_idx+eval_idx],:].clone()                                                                 
+                                else:
+                                    hl_actions = eval_hl_actions 
+                                    
 
                             
                             self.fb_alg.update_transition_pre(hl_obs, hl_actions)                    

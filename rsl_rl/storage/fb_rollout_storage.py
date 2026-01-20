@@ -69,6 +69,8 @@ class FBRolloutStorage:
             self.save_to_disk()
             self.clear()
         # Core
+        
+            
         self.observations[self.step].copy_(transition.observations)
         self.actions[self.step].copy_(transition.actions)
         self.rewards[self.step].copy_(transition.rewards.view(-1, 1))
