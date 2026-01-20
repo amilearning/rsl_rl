@@ -127,8 +127,7 @@ class FBAlgorithm:
                                         {'params': self.backward_net.parameters(), 'lr': self.lr_coef * self.alg_cfg['learning_rate']}],
                                        lr=self.alg_cfg['learning_rate'])
         self.train()
-        self.forward_target_net.train()
-        self.backward_target_net.train()
+
         
         self.storage: FBRolloutStorage | None = None        
         self.transition = FBRolloutStorage.Transition()
@@ -176,6 +175,9 @@ class FBAlgorithm:
         for net in [self.policy, self.forward_net, self.backward_net]:
             net.train(training)
             
+        self.forward_target_net.train()
+        self.backward_target_net.train()
+            
 
     def get_goal_z(self, obs):        
         
@@ -195,29 +197,27 @@ class FBAlgorithm:
               
         return z
     
-    # def init_meta(self) -> MetaDict:        
-    #     z = self.sample_z(1)
-    #     z = z.squeeze().numpy()
-    #     meta = OrderedDict()
-    #     meta['z'] = z
-    #     return meta
+    def get_z_from_rewards(self,batch_size):
+        obs_buf, rewards_buf = self.storage.get_obs_rewards()
+        obs_f = obs_buf.reshape(obs_buf.shape[0]*obs_buf.shape[1], -1).to(self.device)           # [B*E, obs_dim]
+        rew_f = rewards_buf.reshape(rewards_buf.shape[0]* rewards_buf.shape[1], -1).to(self.device)  # [B,E,1]
+        
+        with torch.no_grad():            
+            Bz = self.backward_net(obs_f)        
+            z = torch.matmul(rew_f.T, Bz) / rew_f.shape[0]
+            z = math.sqrt(self.z_dim) * F.normalize(z, dim=-1)      
+        
+        return z.repeat(batch_size,1)  # [B,1,z_dim]
+        
     
-    # def update_meta(
-    #     self,
-    #     meta: MetaDict,
-    #     global_step: int,
-    # ) -> MetaDict:
-    #     if global_step % self.update_z_every_step == 0:
-    #         return self.init_meta()
-    #     return meta
-    
-  
     def act(self, obs: torch.Tensor, is_eval= False) -> torch.Tensor:
         # Compute the actions        
 
         if is_eval:
             ### during training, sample z             
-            goal_z = self.get_goal_z(obs)
+            # goal_z = self.get_goal_z(obs)
+            goal_z = self.get_z_from_rewards(obs.shape[0])
+         
         else:
             goal_z = self.sample_z(1, obs.shape[0])
             goal_z = goal_z.squeeze(0)

@@ -25,7 +25,7 @@ class OnPolicyRunner:
 
     def __init__(self, env: VecEnv, train_cfg: dict, log_dir: str | None = None, device: str = "cpu") -> None:
         self.cfg = train_cfg
-        self.alg_cfg = train_cfg["algorithm"]
+        self.alg_cfg = train_cfg["algorithm"]        
         self.policy_cfg = train_cfg["policy"]
         self.device = device
         self.env = env

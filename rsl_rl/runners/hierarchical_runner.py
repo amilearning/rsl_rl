@@ -8,7 +8,8 @@ from __future__ import annotations
 import os
 from tabnanny import check
 import time
-
+import statistics
+from source.isaaclab.isaaclab.envs.manager_based_rl_env import ManagerBasedRLEnv
 import torch
 import warnings
 from collections import deque
@@ -22,6 +23,7 @@ from rsl_rl.runners import OnPolicyRunner
 from rsl_rl.utils import resolve_obs_groups, store_code_state
 
 
+
 class HierarchicalRunner(OnPolicyRunner):
     """On-policy runner for training and evaluation of high and low level hierarchical training."""
 
@@ -30,12 +32,30 @@ class HierarchicalRunner(OnPolicyRunner):
         self.alg_cfg = train_cfg["algorithm"]
         self.policy_cfg = train_cfg["policy"]
         
-        self.fb_alg_cfg = train_cfg['fb_algorithm']        
-        self.fb_policy_cfg = train_cfg["fb_policy"]
+        self.hlg_alg_cfg = train_cfg["algorithm"].copy()
+        self.hlg_policy_cfg = train_cfg["policy"].copy()
+        
+        self.fb_alg_cfg = train_cfg['fb_algorithm'].copy()        
+        self.fb_policy_cfg = train_cfg["fb_policy"].copy()
         
         self.device = device
         self.env = env
+        
+        
+        base_env = env
+        max_while_count = 10
+        count = 0
+        
+        while count < max_while_count:
+            if hasattr(base_env, "env"):
+                base_env = base_env.env
+            else:
+                break   # exits loop quietly, program continues
+            count += 1
+        self.base_env = base_env
+        self.hl_action_dim = self.base_env.command_manager.get_term('base_velocity').command.shape[-1]                
 
+        
         self.prev_data_path = None 
         # Check if multi-GPU is enabled
         self._configure_multi_gpu()
@@ -66,16 +86,55 @@ class HierarchicalRunner(OnPolicyRunner):
         self.git_status_repos = [rsl_rl.__file__]
         
         self.alg, self.fb_alg = self._construct_algorithm(obs)        
+        self.hlg_alg = self._construct_hlg_algorithm(obs)
 
+
+    def _construct_hlg_algorithm(self, obs: TensorDict) -> PPO:
+        """Construct the high-level actor-critic algorithm."""
+        # Resolve RND config
+        self.hlg_alg_cfg = resolve_rnd_config(self.hlg_alg_cfg, obs, self.cfg["hl_obs_groups"], self.env)
+        # Resolve symmetry config
+        self.hlg_alg_cfg = resolve_symmetry_config(self.hlg_alg_cfg, self.env)
+        # Initialize the policy
+        
+        if self.cfg.get("empirical_normalization") is not None:
+            warnings.warn(
+                "The `empirical_normalization` parameter is deprecated. Please set `actor_obs_normalization` and "
+                "`critic_obs_normalization` as part of the `policy` configuration instead.",
+                DeprecationWarning,
+            )
+            if self.hlg_policy_cfg.get("actor_obs_normalization") is None:
+                self.hlg_policy_cfg["actor_obs_normalization"] = self.cfg["empirical_normalization"]
+            if self.hlg_policy_cfg.get("critic_obs_normalization") is None:
+                self.hlg_policy_cfg["critic_obs_normalization"] = self.cfg["empirical_normalization"]
+
+        actor_critic_class = eval(self.hlg_policy_cfg.pop("class_name"))
+        actor_critic: ActorCritic | ActorCriticRecurrent = actor_critic_class(
+            obs, self.cfg["hl_obs_groups"], self.hl_action_dim, **self.hlg_policy_cfg
+        ).to(self.device)
+
+        
+        # Initialize the algorithm
+        alg_class = eval(self.hlg_alg_cfg.pop("class_name"))
+        alg: PPO = alg_class(actor_critic, device=self.device, **self.hlg_alg_cfg, multi_gpu_cfg=self.multi_gpu_cfg)
+
+        # Initialize the storage
+        alg.init_storage(
+            "rl",
+            self.env.num_envs,
+            self.num_steps_per_env,
+            obs,
+            [self.hl_action_dim],
+        )
+
+        return alg
 
     def _construct_algorithm(self, obs: TensorDict) -> tuple[PPO, FBAlgorithm]:
         """Construct the actor-critic algorithm."""
         # Resolve RND config
         self.alg_cfg = resolve_rnd_config(self.alg_cfg, obs, self.cfg["obs_groups"], self.env)
-
         # Resolve symmetry config
         self.alg_cfg = resolve_symmetry_config(self.alg_cfg, self.env)
-
         # Resolve deprecated normalization config
         if self.cfg.get("empirical_normalization") is not None:
             warnings.warn(
@@ -99,13 +158,12 @@ class HierarchicalRunner(OnPolicyRunner):
         alg: PPO = alg_class(actor_critic, device=self.device, **self.alg_cfg, multi_gpu_cfg=self.multi_gpu_cfg)
         
         
-        alg_class = eval(self.fb_alg_cfg.pop("class_name"))
-        
+        fb_alg_class = eval(self.fb_alg_cfg.pop("class_name"))        
         ''' 
         TODO: get the hl action dim from the env command term
         '''
-        self.hl_action_dim = self.env.env.env.env.command_manager.get_term('base_velocity').command.shape[-1]                
-        fb_alg: FBAlgorithm = alg_class(log_dir = self.log_dir, 
+        
+        fb_alg: FBAlgorithm = fb_alg_class(log_dir = self.log_dir, 
                                         cfg = self.cfg,
                                         action_dim = self.hl_action_dim,
                                         obs_dim = obs['hl_policy'].shape[-1],                                        
@@ -135,6 +193,8 @@ class HierarchicalRunner(OnPolicyRunner):
             "fb_alg_state": self.fb_alg.get_state(),
             "model_state_dict": self.alg.policy.state_dict(),
             "optimizer_state_dict": self.alg.optimizer.state_dict(),
+            "hlg_model_state_dict": self.hlg_alg.policy.state_dict(),
+            "hlg_optimizer_state_dict": self.hlg_alg.optimizer.state_dict(),
             "iter": self.current_learning_iteration,
             "infos": infos,
         }
@@ -152,16 +212,21 @@ class HierarchicalRunner(OnPolicyRunner):
         loaded_dict = torch.load(path, weights_only=False, map_location=map_location)
         # Load model
         resumed_training = self.alg.policy.load_state_dict(loaded_dict["model_state_dict"])
+        if resumed_training:
+            self.hlg_alg.policy.load_state_dict(loaded_dict["hlg_model_state_dict"])
+        
         # Load optimizer if used
         if load_optimizer and resumed_training:
             # Algorithm optimizer
             self.alg.optimizer.load_state_dict(loaded_dict["optimizer_state_dict"])            
+            self.hlg_alg.optimizer.load_state_dict(loaded_dict["hlg_optimizer_state_dict"])
         # Load current learning iteration
         if resumed_training:
             self.current_learning_iteration = loaded_dict["iter"]
             
         if "fb_alg_state" in loaded_dict:
             self.fb_alg.load_state(loaded_dict["fb_alg_state"], load_optim=load_optimizer)        
+            self.fb_alg.storage.load_latest(os.path.dirname(path))
         # self.fb_alg.storage.load_latest(os.path.dirname(path))
         self.prev_data_path = path
         
@@ -190,11 +255,13 @@ class HierarchicalRunner(OnPolicyRunner):
         self.writer.add_scalar(f"{prefix}/actor_logprob", m.get("actor_logprob", 0.0), step)
         
    
-    def train_fb(self):
-        num_updates = self.fb_alg_cfg['num_agent_updates']
-        for train_it in range(num_updates):
-            # 1. Run one FB update
-            self.fb_alg.update()
+    def train_mode(self) -> None:        
+        self.alg.policy.train()
+        self.hlg_alg.policy.train()                
+        if hasattr(self.alg, "rnd") and self.alg.rnd:
+            self.alg.rnd.train()                    
+        if hasattr(self.hlg_alg, "rnd") and self.hlg_alg.rnd:
+            self.hlg_alg.rnd.train()
             
             
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False) -> None:
@@ -213,34 +280,32 @@ class HierarchicalRunner(OnPolicyRunner):
 
         # Book keeping
         ep_infos = []
-        rewbuffer = deque(maxlen=100)
-        lenbuffer = deque(maxlen=100)
-        cur_reward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
+        rewbuffer = deque(maxlen=100)        
+        hl_rewbuffer = deque(maxlen=100)
+        lenbuffer = deque(maxlen=100)        
+        cur_reward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)        
+        cur_hl_reward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
         cur_episode_length = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
 
-        # Create buffers for logging extrinsic and intrinsic rewards
-        if self.alg.rnd:
-            erewbuffer = deque(maxlen=100)
-            irewbuffer = deque(maxlen=100)
-            cur_ereward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
-            cur_ireward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
+      
 
-        # Ensure all parameters are in-synced
-        if self.is_distributed:
-            print(f"Synchronizing parameters for rank {self.gpu_global_rank}...")
-            self.alg.broadcast_parameters()
-
-        # Start training
         start_iter = self.current_learning_iteration
         tot_iter = start_iter + num_learning_iterations
         
-        hl_action_command = self.env.env.env.env.command_manager.get_term('base_velocity').command.clone()
+        hl_actions = self.base_env.command_manager.get_term('base_velocity').command.clone()
+        hlg_actions = hl_actions.clone()
+        iter_count = 0
         
         for it in range(start_iter, tot_iter):
+            iter_count += 1
             start = time.time()
             # Rollout
             with torch.inference_mode():
                 for itt in range(self.num_steps_per_env):                    
+
+                    # TODO # TODO # TODO # TODO # TODO # TODO # TODO # TODO # TODO # TODO # TODO # TODO 
+                    # TODO # TODO # TODO # TODO # TODO # TODO # TODO # TODO # TODO # TODO # TODO # TODO 
+                    # TODO # TODO # TODO # TODO # TODO # TODO # TODO # TODO # TODO # TODO # TODO # TODO 
                     '''
                     high level policy interaction
                     '''          
@@ -248,9 +313,45 @@ class HierarchicalRunner(OnPolicyRunner):
                         '''
                         TODO : get the hl action command from the env command term
                         '''
-                        hl_obs =  obs.clone()                        
-                        hl_action_command = self.env.env.env.env.command_manager.get_term('base_velocity').command.clone()
-                        self.fb_alg.update_transition_pre(hl_obs, hl_action_command)                    
+                        hl_obs =  obs.clone()                                                
+                        current_hl_command = self.base_env.command_manager.get_term('base_velocity').command.clone()                        
+                        if self.cfg["train_hl_policy"]: 
+                            hl_actions = current_hl_command                            
+                            explore_hl_actions = self.fb_alg.act(hl_obs, is_eval=False)     
+                            eval_hl_actions = None
+                            num_envs = hl_actions.shape[0]                            
+                            # Define ratios as fractions (ensure they sum to 1.0 for full coverage)
+                            if iter_count < self.fb_alg_cfg["num_prior_data_collect_epoch"]:
+                                cmd_ratio = 0.8
+                                explore_ratio = 0.2                                
+                            else:                      
+                                cmd_explore_ratio = max(0.5, 0.8 - 0.6 * (iter_count - self.fb_alg_cfg["num_prior_data_collect_epoch"]) / 50)          
+                                cmd_ratio = cmd_explore_ratio/2.0
+                                explore_ratio = cmd_explore_ratio/2.0 # min(0.4, 0.2 + 0.2 * (iter_count - self.fb_alg_cfg["num_prior_data_collect_epoch"]) / 50)                                
+                                eval_ratio = 1.0 - cmd_ratio - explore_ratio
+                                
+                                eval_hl_actions = self.fb_alg.act(hl_obs, is_eval=True)
+                                # cmd_ratio = 0.0
+                                # explore_ratio = 0.0                                
+                            
+                            cmd_count = int(num_envs * cmd_ratio)
+                            explore_count = int(num_envs * explore_ratio)                            
+                            
+                            # Permute indices and split into segments
+                            permuted_indices = torch.randperm(num_envs)
+                            cmd_idx = permuted_indices[:cmd_count]
+                            explore_idx = permuted_indices[cmd_count:cmd_count + explore_count]
+                            eval_idx = permuted_indices[cmd_count + explore_count:]
+                            
+                            # Assign actions to respective subsets
+                            hl_actions[cmd_idx,:] = current_hl_command[cmd_idx,:]
+                            hl_actions[explore_idx,:] = explore_hl_actions[explore_idx,:]
+                            if eval_hl_actions is not None:
+                                # hl_actions[eval_idx,:] = eval_hl_actions[eval_idx,:]
+                                #TODO: temp fix
+                                hl_actions = eval_hl_actions
+
+                        self.fb_alg.update_transition_pre(hl_obs, hl_actions)                    
                     # if itt % self.cfg["hl_policy_decimation_multiplier"] == 0 and itt > 1:                                                                                            
                     #     hl_actions = self.fb_alg.act(hl_obs, is_eval = False)
                     #     if it > self.fb_alg_cfg["num_prior_data_collect_epoch"]+1:                            
@@ -258,7 +359,20 @@ class HierarchicalRunner(OnPolicyRunner):
                     '''
                     remap the hl action command to the obs for ll policy
                     '''
-                    obs['policy'][:,-self.hl_action_dim:] = hl_action_command                                        
+                    
+                    # obs['policy'][:,-self.hl_action_dim:] = hl_actions.clone()                                       
+                    if itt % self.cfg["hl_policy_decimation_multiplier"] == 0:                    
+                        if self.cfg["train_hlg_policy"]:
+                            hlg_actions = self.hlg_alg.act(hl_obs)                    
+                            hl_actions = hlg_actions
+
+                    # TODO # TODO # TODO # TODO # TODO # TODO # TODO # TODO # TODO # TODO # TODO # TODO 
+                    # TODO # TODO # TODO # TODO # TODO # TODO # TODO # TODO # TODO # TODO # TODO # TODO 
+                    # TODO # TODO # TODO # TODO # TODO # TODO # TODO # TODO # TODO # TODO # TODO # TODO                  
+                                        
+                    obs['policy'][:,-self.hl_action_dim:] = hl_actions.clone()                         
+                    self.base_env.command_manager.get_term('base_velocity').vel_command_b = hl_actions.clone()                    
+
 
                     '''
                     low level policy interaction
@@ -266,11 +380,15 @@ class HierarchicalRunner(OnPolicyRunner):
                     # Sample ll_actions
                     ll_actions = self.alg.act(obs)
                     # Step the environment
-                    obs, rewards, dones, extras = self.env.step(ll_actions.to(self.env.device))
+                    obs, (hl_rewards, rewards), dones, extras = self.env.step(ll_actions.to(self.env.device))
                     # Move to device
                     obs, rewards, dones = (obs.to(self.device), rewards.to(self.device), dones.to(self.device))
+                    
                     # Process the step
                     self.alg.process_env_step(obs, rewards, dones, extras)
+                    
+                    if itt % self.cfg["hl_policy_decimation_multiplier"] == 0:    
+                        self.hlg_alg.process_env_step(obs, hl_rewards, dones, extras)
                     
                     if itt % self.cfg["hl_policy_decimation_multiplier"] == 0:    
                         hl_dones = dones.clone()                            
@@ -279,41 +397,30 @@ class HierarchicalRunner(OnPolicyRunner):
                         hl_dones = hl_dones | dones
                         hl_time_outs = hl_time_outs | extras['time_outs']
                     
-                    if itt % self.cfg["hl_policy_decimation_multiplier"] == 0:    
-                        '''
-                        TODO: compute hl_rewards if can 
-                        '''
-                        hl_rewards = rewards.clone()                                                
+                    if itt % self.cfg["hl_policy_decimation_multiplier"] == 0:                                                    
+                        hl_rewards = hl_rewards.to(self.device)                                         
                         self.fb_alg.update_transition_post(hl_rewards, hl_dones, hl_time_outs)
                                                  
-                    # Extract intrinsic rewards (only for logging)
-                    intrinsic_rewards = self.alg.intrinsic_rewards if self.alg.rnd else None
+                    
                     # Book keeping
                     if self.log_dir is not None:
                         if "episode" in extras:
                             ep_infos.append(extras["episode"])
                         elif "log" in extras:
                             ep_infos.append(extras["log"])
-                        # Update rewards
-                        if self.alg.rnd:
-                            cur_ereward_sum += rewards
-                            cur_ireward_sum += intrinsic_rewards
-                            cur_reward_sum += rewards + intrinsic_rewards
-                        else:
-                            cur_reward_sum += rewards
+                        # Update rewards                     
+                        cur_reward_sum += rewards                        
+                        cur_hl_reward_sum += hl_rewards
                         # Update episode length
                         cur_episode_length += 1
                         # Clear data for completed episodes
                         new_ids = (dones > 0).nonzero(as_tuple=False)
                         rewbuffer.extend(cur_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
+                        hl_rewbuffer.extend(cur_hl_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
                         lenbuffer.extend(cur_episode_length[new_ids][:, 0].cpu().numpy().tolist())
-                        cur_reward_sum[new_ids] = 0
-                        cur_episode_length[new_ids] = 0
-                        if self.alg.rnd:
-                            erewbuffer.extend(cur_ereward_sum[new_ids][:, 0].cpu().numpy().tolist())
-                            irewbuffer.extend(cur_ireward_sum[new_ids][:, 0].cpu().numpy().tolist())
-                            cur_ereward_sum[new_ids] = 0
-                            cur_ireward_sum[new_ids] = 0
+                        cur_reward_sum[new_ids] = 0                        
+                        cur_hl_reward_sum[new_ids] = 0
+                        cur_episode_length[new_ids] = 0                        
 
                 stop = time.time()
                 collection_time = stop - start
@@ -321,25 +428,37 @@ class HierarchicalRunner(OnPolicyRunner):
 
                 # Compute returns
                 self.alg.compute_returns(obs)
+                self.hlg_alg.compute_returns(obs)
 
             # Update policy
-            loss_dict = self.alg.update()
+            if self.cfg['train_ll_policy']:
+                loss_dict = self.alg.update()                
+            else:
+                self.alg.storage.clear()
+                
+            if self.cfg["train_hlg_policy"]:
+                hlg_loss_dict = self.hlg_alg.update()
+            else:                
+                self.hlg_alg.storage.clear()
 
             stop = time.time()
             learn_time = stop - start
             self.current_learning_iteration = it
 
-            fb_start = time.time()
-            if self.cfg["resume"] or it > self.fb_alg_cfg["num_prior_data_collect_epoch"]: #                                              
-                self.train_fb()
-            fb_stop = time.time()            
-            train_fb_time = fb_stop - fb_start
+            if self.cfg['train_hl_policy']:                
+                fb_start = time.time()
+                if self.cfg["resume"] or it > self.fb_alg_cfg["num_prior_data_collect_epoch"]: #                                                              
+                    self.train_fb()
+                fb_stop = time.time()            
+                train_fb_time = fb_stop - fb_start
             
             
             if self.log_dir is not None and not self.disable_logs:
                 # Log information
-                self.log(locals())                
-                self.fb_log_metrics(locals())
+                if self.cfg['train_ll_policy']:
+                    self.log(locals())  
+                if self.cfg['train_hl_policy']:                       
+                    self.fb_log_metrics(locals())
                 
                 # Save model
                 if it % self.save_interval == 0:
@@ -364,14 +483,18 @@ class HierarchicalRunner(OnPolicyRunner):
 
     def train_fb(self):
         num_updates = self.fb_alg_cfg['num_agent_updates']
+        self.fb_alg.train()
         for train_it in range(num_updates):
-            # 1. Run one FB update
+            # 1. Run one FB update            
             self.fb_alg.update()
             
             
     def fb_log_metrics(self, locs: dict, prefix: str = "FB") -> None:
         """Log FB + actor metrics stored in self.metrics to a SummaryWriter-like `writer`."""
+        
         step = locs["it"]        
+        if len(locs["hl_rewbuffer"]) > 0:
+            self.writer.add_scalar("Train/hl_mean_reward", statistics.mean(locs["hl_rewbuffer"]), locs["it"])
         m = self.fb_alg.metrics
         self.writer.add_scalar(f"{prefix}/target_M", m.get("target_M", 0.0), step)
         self.writer.add_scalar(f"{prefix}/M1", m.get("M1", 0.0), step)

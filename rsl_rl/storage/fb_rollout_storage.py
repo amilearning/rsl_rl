@@ -57,10 +57,15 @@ class FBRolloutStorage:
 
         # Counter for the number of transitions stored
         self.step = 0
+        self.is_full = False
 
+    
+    
+    
     def add_transitions(self, transition: Transition) -> None:
         # Check if the transition is valid
         if self.step >= self.max_buffer_size:
+            self.is_full = True
             self.save_to_disk()
             self.clear()
         # Core
@@ -155,10 +160,10 @@ class FBRolloutStorage:
 
         # 5) Update step counter
         self.step = size
-
+        
         tag = f" from {source_desc}" if source_desc else ""
         print(f"[FBRolloutStorage] Successfully loaded {size} transitions{tag}.")
-
+        
         return True
 
     def _get_buffer_files(self, load_path):
@@ -450,6 +455,17 @@ class FBRolloutStorage:
         goal_ts = torch.where(mask_traj, middle_ts, random_goal_ts)  # [B, E]
 
         return goal_ts
+    
+    def get_obs_rewards(self):
+        if self.step == 0:
+            raise ValueError("No data in buffer to get obs and rewards.")        
+        batch_size = self.step        
+        obs_buf = self.observations["hl_policy"]  # [N, obs_dim]
+        obs_buf = obs_buf[:batch_size,:,:]  # [B, E, obs_dim]
+        rewards = self.rewards[:batch_size,:,0]  # [B, E]
+        return obs_buf, rewards
+        
+        
     
     def sample(self, batch_size: int, idxs: torch.Tensor | None = None, evaluation: bool = False):
         """
