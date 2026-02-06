@@ -4,8 +4,8 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 """Implementation of runners for environment-agent interaction."""
-
+from .encoder_policy_runner import EncoderOnPolicyRunner
 from .on_policy_runner import OnPolicyRunner  # noqa: I001
 from .distillation_runner import DistillationRunner
 
-__all__ = ["DistillationRunner", "OnPolicyRunner"]
+__all__ = ["DistillationRunner", "OnPolicyRunner", "EncoderOnPolicyRunner"]

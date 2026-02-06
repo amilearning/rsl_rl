@@ -5,6 +5,7 @@
 
 """Implementation of transitions storage for RL-agent."""
 
+from .context_est_dataset import ContextEstDataset
 from .rollout_storage import RolloutStorage
 
-__all__ = ["RolloutStorage"]
+__all__ = ["ContextEstDataset", "RolloutStorage"]
