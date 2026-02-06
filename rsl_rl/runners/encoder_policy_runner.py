@@ -63,15 +63,17 @@ class EncoderOnPolicyRunner:
         self.git_status_repos = [rsl_rl.__file__]
 
         # Optional context dataset
-        
-        
-        self.context_dataset = ContextEstDataset(
-            num_envs=self.env.num_envs,
-            capacity=10 * self.num_steps_per_env,
-            obs=obs,
-            device="cpu",
-            log_dir=self.log_dir,   
-        )
+        self.context_train = bool(self.cfg.get("context_train", False))
+        if self.context_train:
+            self.context_dataset = ContextEstDataset(
+                num_envs=self.env.num_envs,
+                capacity=10 * self.num_steps_per_env,
+                obs=obs,
+                device="cpu",
+                log_dir=self.log_dir,
+            )
+        else:
+            self.context_dataset = None
 
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False) -> None:
         # Initialize writer
@@ -120,7 +122,8 @@ class EncoderOnPolicyRunner:
                     obs, rewards, dones, extras = self.env.step(actions.to(self.env.device))
                     # Move to device
                     obs, rewards, dones = (obs.to(self.device), rewards.to(self.device), dones.to(self.device))
-                    if self.context_dataset is not None:
+                    
+                    if self.context_train and self.context_dataset is not None:
                         self.context_dataset.add(obs, dones)
                         if len(self.context_dataset) > 5:                                    
                             self.context_dataset.save_to_logdir(f"context_est_dataset_{it}.pt")

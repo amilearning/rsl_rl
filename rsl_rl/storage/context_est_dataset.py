@@ -12,15 +12,9 @@ import torch
 from tensordict import TensorDict
 from torch.utils.data import Dataset
 
-from rsl_rl.utils import split_and_pad_trajectories
-
 
 class ContextEstDataset(Dataset):
-    """Chunked dataset storing observations as [time, envs, ...] plus dones.
-
-    When the buffer reaches capacity, trajectories are split and padded using
-    `split_and_pad_trajectories`, and the padded chunk is stored.
-    """
+    """Dataset storing raw observation/done buffers as [time, envs, ...]."""
 
     def __init__(
         self,
@@ -54,7 +48,7 @@ class ContextEstDataset(Dataset):
         self._dones_buffer = torch.zeros(self.capacity, self.num_envs, 1, device=self.device)
         self._step = 0
 
-        # Stored padded chunks: list of (padded_obs, masks)
+        # Stored raw buffers: list of (obs_buffer, dones_buffer)
         self.chunks: list[tuple[TensorDict, torch.Tensor]] = []
 
     def add(self, obs: TensorDict, dones: torch.Tensor) -> None:
@@ -70,17 +64,15 @@ class ContextEstDataset(Dataset):
             self._reset_buffers()
 
 
-
     def _finalize_chunk(self) -> None:
-        padded_obs, masks = split_and_pad_trajectories(self._obs_buffer, self._dones_buffer)
-        self.chunks.append((padded_obs, masks))
+        self.chunks.append((self._obs_buffer.clone(), self._dones_buffer.clone()))
 
     def _reset_buffers(self) -> None:
         self._step = 0
         self._obs_buffer.zero_()
         self._dones_buffer.zero_()
 
-    def clear(self) -> None:        
+    def clear(self) -> None:
         self.chunks.clear()
         self._reset_buffers()
 
@@ -91,8 +83,89 @@ class ContextEstDataset(Dataset):
         torch.save(self.chunks, path)
 
     @staticmethod
-    def load(path: str) -> list[tuple[TensorDict, torch.Tensor]]:
-        return torch.load(path)
+    def load(path: str, history_window: int = 10) -> TensorDict:
+        """Load raw buffers and return windowed trajectories.
+
+        Args:
+            path: Path to saved dataset.
+            history_window: Window length (number of timesteps).
+
+        Returns:
+            TensorDict with batch dimension [num_windows] and each entry shaped
+            [history_window, ...].
+        """
+        tmp_chunks = torch.load(path, weights_only=False)
+        if history_window <= 0:
+            raise ValueError("history_window must be > 0")
+
+        windowed: dict[str, list[TensorDict | torch.Tensor]] = {}
+
+        def _ensure_time_dim(t: torch.Tensor) -> torch.Tensor:
+            # Expect time dimension to be at dim=1 with length history_window.
+            if t.ndim < 3:
+                return t
+            if t.shape[1] == history_window:
+                return t
+            if t.shape[-1] == history_window:
+                perm = [0, t.ndim - 1] + list(range(1, t.ndim - 1))
+                return t.permute(*perm)
+            return t
+
+        for obs_buffer, dones_buffer in tmp_chunks:
+            dones = dones_buffer.squeeze(-1)
+            if dones.ndim != 2:
+                raise ValueError(f"Expected dones [T, N], got {tuple(dones.shape)}")
+            time_steps, num_envs = dones.shape
+            if time_steps < history_window:
+                continue
+
+            t_idx = torch.arange(time_steps, device=dones.device)
+
+            for env_id in range(num_envs):
+                dones_env = dones[:, env_id].bool()
+
+                # Episode start indices: t=0 and timestep after a done
+                start_mask = torch.zeros_like(dones_env)
+                start_mask[0] = True
+                if time_steps > 1:
+                    start_mask[1:] = dones_env[:-1]
+
+                reset_points = torch.where(start_mask, t_idx, torch.zeros_like(t_idx))
+                last_reset = torch.cummax(reset_points, dim=0).values
+                since_reset = t_idx - last_reset + 1
+
+                valid_end = since_reset >= history_window
+                valid_window_mask = valid_end[history_window - 1 :]
+                if not torch.any(valid_window_mask):
+                    continue
+
+                for k, v in obs_buffer.items():
+                    v_env = v[:, env_id]
+                    if isinstance(v_env, TensorDict):
+                        v_windows = v_env.apply(
+                            lambda t: t.unfold(0, history_window, 1)
+                        )
+                        v_selected = v_windows.apply(lambda t: _ensure_time_dim(t[valid_window_mask]))
+                    else:
+                        v_windows = v_env.unfold(0, history_window, 1)
+                        v_selected = _ensure_time_dim(v_windows[valid_window_mask])
+
+                    windowed.setdefault(k, []).append(v_selected)
+
+        if not windowed:
+            raise ValueError("No valid windows found in dataset.")
+
+        out: dict[str, TensorDict | torch.Tensor] = {}
+        for k, items in windowed.items():
+            if isinstance(items[0], TensorDict):
+                out[k] = TensorDict.cat(items, dim=0)
+            else:
+                out[k] = torch.cat(items, dim=0)
+
+        first_key = next(iter(out.keys()))
+        total_windows = out[first_key].batch_size[0] if isinstance(out[first_key], TensorDict) else out[first_key].shape[0]
+        return TensorDict(out, batch_size=[total_windows])
+    
 
     def save_to_logdir(self, filename: str = "context_est_dataset.pt") -> str | None:      
         if self.log_dir is None:
