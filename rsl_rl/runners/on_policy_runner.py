@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import time
+from collections.abc import Callable
 import torch
 
 from rsl_rl.algorithms import PPO
@@ -53,8 +54,24 @@ class OnPolicyRunner:
 
         self.current_learning_iteration = 0
 
-    def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False) -> None:
-        """Run the learning loop for the specified number of iterations."""
+    def learn(
+        self,
+        num_learning_iterations: int,
+        init_at_random_ep_len: bool = False,
+        on_iteration: Callable[[int], None] | None = None,
+        checkpoint_name_fn: Callable[[int], str] | None = None,
+    ) -> None:
+        """Run the learning loop for the specified number of iterations.
+
+        Args:
+            num_learning_iterations: Number of policy update iterations to run.
+            init_at_random_ep_len: Randomise initial episode lengths for exploration.
+            on_iteration: Optional callback called at the *start* of every iteration
+                with the current iteration index. Use this to change the task or
+                environment distribution mid-training without restarting the runner.
+            checkpoint_name_fn: Optional function ``(it) -> filename`` that controls
+                the checkpoint filename. Defaults to ``model_{it}.pt``.
+        """
         # Randomize initial episode lengths (for exploration)
         if init_at_random_ep_len:
             self.env.episode_length_buf = torch.randint_like(
@@ -77,6 +94,8 @@ class OnPolicyRunner:
         start_it = self.current_learning_iteration
         total_it = start_it + num_learning_iterations
         for it in range(start_it, total_it):
+            if on_iteration is not None:
+                on_iteration(it)
             start = time.time()
             # Rollout
             with torch.inference_mode():
@@ -126,11 +145,14 @@ class OnPolicyRunner:
 
             # Save model
             if self.logger.writer is not None and it % self.cfg["save_interval"] == 0:
-                self.save(os.path.join(self.logger.log_dir, f"model_{it}.pt"))  # type: ignore
+                name = checkpoint_name_fn(it) if checkpoint_name_fn else f"model_{it}.pt"
+                self.save(os.path.join(self.logger.log_dir, name))  # type: ignore
 
         # Save the final model after training and stop the logging writer
         if self.logger.writer is not None:
-            self.save(os.path.join(self.logger.log_dir, f"model_{self.current_learning_iteration}.pt"))  # type: ignore
+            it = self.current_learning_iteration
+            name = checkpoint_name_fn(it) if checkpoint_name_fn else f"model_{it}.pt"
+            self.save(os.path.join(self.logger.log_dir, name))  # type: ignore
             self.logger.stop_logging_writer()
 
     def save(self, path: str, infos: dict | None = None) -> None:
